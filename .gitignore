@@ -1,0 +1,39 @@
+# Dependencies
+frontend/node_modules/
+
+# Frontend build output
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime data, caches, uploads, generated reports
+data/
+output/
+unpacked_plan/
+*.xlsx
+*.xls
+*.xlsm
+
+# Logs
+*.log
+logs/
+
+# Local/editor files
+.claude/
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+*.local
+
+# Temporary document internals
+~$*

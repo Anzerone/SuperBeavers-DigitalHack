@@ -1,0 +1,15 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+sqlalchemy[asyncio]>=2.0
+asyncpg>=0.29
+psycopg2-binary>=2.9
+python-multipart>=0.0.6
+aiohttp>=3.9
+requests>=2.31
+pandas>=2.1
+openpyxl>=3.1
+python-calamine>=0.2
+numpy>=1.26
+scikit-learn>=1.4
+sentence-transformers>=3.0
+torch>=2.2
