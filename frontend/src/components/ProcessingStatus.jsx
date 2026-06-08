@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react'
-import { CheckCircle2, Clock3, Loader2 } from 'lucide-react'
 import { getStatus } from '../api.js'
+import GovIcon from './GovIcon.jsx'
 
 const STEPS = [
-  { name: 'Эмбеддинги bge-m3', startAt: 0.03, doneAt: 0.4 },
-  { name: 'Классификация и проверка моделью', startAt: 0.4, doneAt: 0.62 },
-  { name: 'Кластеризация по районам', startAt: 0.7, doneAt: 0.86 },
-  { name: 'Отчет и кэш справки', startAt: 0.9, doneAt: 1 },
+  { name: 'Анализ содержания писем', startAt: 0.03, doneAt: 0.4 },
+  { name: 'Категоризация и уточнение сложных случаев', startAt: 0.4, doneAt: 0.62 },
+  { name: 'Поиск повторяющихся проблем по районам', startAt: 0.7, doneAt: 0.86 },
+  { name: 'Подготовка аналитической сводки', startAt: 0.9, doneAt: 1 },
 ]
 
 export default function ProcessingStatus({ runId, onComplete }) {
@@ -98,9 +98,9 @@ export default function ProcessingStatus({ runId, onComplete }) {
           const state = stepStates[index]
           return (
             <div key={step.name} className="flex items-center gap-2 text-sm">
-              {state === 'done' && <CheckCircle2 className="h-4 w-4 shrink-0 text-green-500" />}
-              {state === 'active' && <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#0d7377]" />}
-              {state === 'pending' && <Clock3 className="h-4 w-4 shrink-0 text-gray-300" />}
+              {state === 'done' && <GovIcon name="check" className="h-4 w-4 shrink-0 text-green-500" />}
+              {state === 'active' && <GovIcon name="spinner" className="h-4 w-4 shrink-0 animate-spin text-[#0d7377]" />}
+              {state === 'pending' && <GovIcon name="clock" className="h-4 w-4 shrink-0 text-gray-300" />}
               <span
                 className={
                   state === 'done'

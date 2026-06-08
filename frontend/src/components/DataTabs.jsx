@@ -1,29 +1,72 @@
 import { useState, useEffect } from 'react'
 import { getClusters, getAppeals } from '../api.js'
+import SimilarModal from './SimilarModal.jsx'
 import { SEVERITY_STYLES, formatSeverity } from '../utils/severity.js'
+import GovIcon from './GovIcon.jsx'
 
-export default function DataTabs({ runId, filters, onExport }) {
+// Убираем дублирование: имя кластера часто начинается с названия категории
+// ("Дороги: ..."), а категория уже показана в отдельном столбце.
+function cleanClusterName(name, category) {
+  let result = (name || '').trim()
+  if (category) {
+    const prefix = `${category}:`
+    if (result.toLowerCase().startsWith(prefix.toLowerCase())) {
+      result = result.slice(prefix.length).trim()
+    }
+  }
+  result = result.replace(/^["'«»\s]+/, '').replace(/[\s.…]+$/, '')
+  return result || name || ''
+}
+
+export default function DataTabs({ runId, filters, refreshKey = 0, onExport }) {
   const [tab, setTab] = useState('clusters')
   const [clusters, setClusters] = useState(null)
   const [appeals, setAppeals] = useState(null)
   const [clusterFilter, setClusterFilter] = useState(null)
   const [page, setPage] = useState(1)
   const [search, setSearch] = useState('')
+  const [similarFor, setSimilarFor] = useState(null)
+
+  useEffect(() => {
+    setPage(1)
+    setClusterFilter(null)
+  }, [runId, filters])
 
   // Load clusters
   useEffect(() => {
     if (!runId || tab !== 'clusters') return
+    let cancelled = false
+    setClusters(null)
     getClusters(runId, { ...filters, search: search || undefined, page, page_size: 15 })
-      .then(setClusters).catch(console.error)
-  }, [runId, tab, filters, page, search])
+      .then(data => {
+        if (!cancelled) setClusters(data)
+      })
+      .catch(error => {
+        if (!cancelled) console.error(error)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [runId, tab, filters, page, search, refreshKey])
 
   // Load appeals
   useEffect(() => {
     if (!runId || tab !== 'appeals') return
+    let cancelled = false
+    setAppeals(null)
     const params = { ...filters, page, page_size: 20, search: search || undefined }
     if (clusterFilter) params.cluster_id = clusterFilter
-    getAppeals(runId, params).then(setAppeals).catch(console.error)
-  }, [runId, tab, filters, clusterFilter, page, search])
+    getAppeals(runId, params)
+      .then(data => {
+        if (!cancelled) setAppeals(data)
+      })
+      .catch(error => {
+        if (!cancelled) console.error(error)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [runId, tab, filters, clusterFilter, page, search, refreshKey])
 
   const goToAppeals = (clusterId) => {
     setClusterFilter(clusterId)
@@ -57,7 +100,7 @@ export default function DataTabs({ runId, filters, onExport }) {
               onClick={onExport}
               className="ml-3 px-3 py-1.5 bg-white border border-gray-300 rounded-lg text-sm font-medium hover:bg-gray-50"
             >
-              Загрузить
+              Скачать
             </button>
           )}
         </div>
@@ -65,9 +108,9 @@ export default function DataTabs({ runId, filters, onExport }) {
           {clusterFilter && (
             <button
               onClick={() => { setClusterFilter(null); setPage(1) }}
-              className="text-xs px-2 py-1 bg-[#0d7377]/10 text-[#0d7377] rounded-full"
+              className="inline-flex items-center gap-1 text-xs px-2 py-1 bg-[#0d7377]/10 text-[#0d7377] rounded-full"
             >
-              Кластер ✕
+              Кластер <GovIcon name="close" className="h-3 w-3" />
             </button>
           )}
           <input
@@ -80,44 +123,54 @@ export default function DataTabs({ runId, filters, onExport }) {
       </div>
 
       {/* Clusters tab */}
-      {tab === 'clusters' && clusters && (
+      {tab === 'clusters' && (
         <div>
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="text-left px-4 py-2 font-medium text-gray-500">ПРОБЛЕМА</th>
-                <th className="text-left px-4 py-2 font-medium text-gray-500">РАЙОН</th>
-                <th className="text-left px-4 py-2 font-medium text-gray-500">КАТЕГОРИЯ</th>
-                <th className="text-left px-4 py-2 font-medium text-gray-500">ТЯЖЕСТЬ</th>
-                <th className="text-right px-4 py-2 font-medium text-gray-500">ОБРАЩЕНИЙ</th>
-                <th className="px-4 py-2 w-10"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {clusters.items?.map(c => (
-                <tr key={c.id} className="border-t hover:bg-gray-50">
-                  <td className="px-4 py-3 max-w-[300px] truncate">{c.cluster_name}</td>
-                  <td className="px-4 py-3 text-gray-600">{c.municipality}</td>
-                  <td className="px-4 py-3 text-gray-600">{c.category}</td>
-                  <td className="px-4 py-3">
-                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${SEVERITY_STYLES[c.severity] || 'bg-gray-100'}`}>
-                      {formatSeverity(c.severity, { short: true })}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-right font-medium">{c.appeal_count}</td>
-                  <td className="px-4 py-3">
-                    <button
-                      onClick={() => goToAppeals(c.id)}
-                      className="text-gray-400 hover:text-[#0d7377] transition"
-                    >
-                      →
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <Pagination data={clusters} page={page} setPage={setPage} />
+          {!clusters ? (
+            <div className="px-4 py-10 text-center text-gray-400 text-sm">Загрузка кластеров…</div>
+          ) : clusters.items?.length === 0 ? (
+            <div className="px-4 py-10 text-center text-gray-400 text-sm">Кластеры проблем не найдены</div>
+          ) : (
+            <>
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="text-left px-4 py-2 font-medium text-gray-500">ПРОБЛЕМА</th>
+                    <th className="text-left px-4 py-2 font-medium text-gray-500">РАЙОН</th>
+                    <th className="text-left px-4 py-2 font-medium text-gray-500">КАТЕГОРИЯ</th>
+                    <th className="text-left px-4 py-2 font-medium text-gray-500">ТЯЖЕСТЬ</th>
+                    <th className="text-right px-4 py-2 font-medium text-gray-500">ОБРАЩЕНИЙ</th>
+                    <th className="px-4 py-2 w-10"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {clusters.items?.map(c => (
+                    <tr key={c.id} className="border-t hover:bg-gray-50">
+                      <td className="px-4 py-3 max-w-[300px] truncate" title={cleanClusterName(c.cluster_name, c.category)}>{cleanClusterName(c.cluster_name, c.category)}</td>
+                      <td className="px-4 py-3 text-gray-600">{c.municipality}</td>
+                      <td className="px-4 py-3 text-gray-600">{c.category}</td>
+                      <td className="px-4 py-3">
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${SEVERITY_STYLES[c.severity] || 'bg-gray-100'}`}>
+                          {formatSeverity(c.severity, { short: true })}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-right font-medium">{c.appeal_count}</td>
+                      <td className="px-4 py-3">
+                        <button
+                          onClick={() => goToAppeals(c.id)}
+                          className="text-gray-400 hover:text-[#0d7377] transition"
+                          title="Показать обращения"
+                          aria-label="Показать обращения"
+                        >
+                          <GovIcon name="arrowRight" className="h-4 w-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <Pagination data={clusters} page={page} setPage={setPage} />
+            </>
+          )}
         </div>
       )}
 
@@ -132,6 +185,7 @@ export default function DataTabs({ runId, filters, onExport }) {
                 <th className="text-left px-4 py-2 font-medium text-gray-500">ТЯЖЕСТЬ</th>
                 <th className="text-left px-4 py-2 font-medium text-gray-500">КАТЕГОРИЯ</th>
                 <th className="text-left px-4 py-2 font-medium text-gray-500">ИТОГ</th>
+                <th className="px-2 py-2 w-10"></th>
               </tr>
             </thead>
             <tbody>
@@ -150,12 +204,25 @@ export default function DataTabs({ runId, filters, onExport }) {
                   </td>
                   <td className="px-4 py-3 text-gray-600">{a.category}</td>
                   <td className="px-4 py-3 text-gray-500">{a.outcome || ''}</td>
+                  <td className="px-2 py-3">
+                    <button
+                      onClick={() => setSimilarFor(a)}
+                      title="Найти похожие обращения"
+                      className="text-gray-400 hover:text-teal-700 text-sm"
+                    >
+                      <GovIcon name="search" className="h-4 w-4" />
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
           <Pagination data={appeals} page={page} setPage={setPage} />
         </div>
+      )}
+
+      {similarFor && (
+        <SimilarModal appeal={similarFor} onClose={() => setSimilarFor(null)} />
       )}
     </div>
   )
@@ -174,7 +241,7 @@ function Pagination({ data, page, setPage }) {
           disabled={page <= 1}
           className="px-3 py-1 text-sm border rounded hover:bg-gray-50 disabled:opacity-40"
         >
-          ←
+          <GovIcon name="arrowLeft" className="h-4 w-4" />
         </button>
         <span className="px-3 py-1 text-sm text-gray-600">
           {page} / {data.pages}
@@ -184,7 +251,7 @@ function Pagination({ data, page, setPage }) {
           disabled={page >= data.pages}
           className="px-3 py-1 text-sm border rounded hover:bg-gray-50 disabled:opacity-40"
         >
-          →
+          <GovIcon name="arrowRight" className="h-4 w-4" />
         </button>
       </div>
     </div>

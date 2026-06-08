@@ -1,6 +1,65 @@
 import axios from 'axios'
 
 const api = axios.create({ baseURL: '/api' })
+const TOKEN_KEY = 'authToken'
+
+export function getAuthToken() {
+  return localStorage.getItem(TOKEN_KEY)
+}
+
+export function setAuthToken(token) {
+  if (token) localStorage.setItem(TOKEN_KEY, token)
+  else localStorage.removeItem(TOKEN_KEY)
+}
+
+api.interceptors.request.use((config) => {
+  const token = getAuthToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
+api.interceptors.response.use(
+  response => response,
+  error => {
+    if (error.response?.status === 401) {
+      setAuthToken(null)
+    }
+    return Promise.reject(error)
+  }
+)
+
+export async function login(username, password) {
+  const { data } = await api.post('/auth/login', { username, password })
+  setAuthToken(data.access_token)
+  return data.user
+}
+
+export async function getCurrentUser() {
+  const { data } = await api.get('/auth/me')
+  return data
+}
+
+export function logout() {
+  setAuthToken(null)
+}
+
+// Мультивыбор: значения фильтров могут быть массивами — склеиваем в строку
+// через разделитель, которого заведомо нет в данных (запятая встречается
+// в самих значениях, напр. "Омская область, другое"). Бэкенд разбирает обратно.
+export const FILTER_SEP = '\u001f'
+
+function flattenFilters(params = {}) {
+  const out = {}
+  for (const [k, v] of Object.entries(params)) {
+    if (v == null) continue
+    if (Array.isArray(v)) {
+      if (v.length) out[k] = v.join(FILTER_SEP)
+    } else {
+      out[k] = v
+    }
+  }
+  return out
+}
 
 export async function uploadFile(file) {
   const form = new FormData()
@@ -19,6 +78,11 @@ export async function getStatus(runId) {
   return data
 }
 
+export async function getLatestRun() {
+  const { data } = await api.get('/processing/latest')
+  return data
+}
+
 export async function getStats(runId) {
   const { data } = await api.get(`/dashboard/stats/${runId}`)
   return data
@@ -30,26 +94,44 @@ export async function getTopDistricts(runId, n = 10) {
 }
 
 export async function getChartData(runId, filters = {}) {
-  const params = new URLSearchParams()
-  if (filters.municipality) params.set('municipality', filters.municipality)
-  if (filters.severity) params.set('severity', filters.severity)
-  if (filters.category) params.set('category', filters.category)
+  const params = new URLSearchParams(flattenFilters(filters))
   const { data } = await api.get(`/dashboard/charts/${runId}?${params}`)
   return data
 }
 
+export async function getTimeline(runId, filters = {}, granularity = 'week') {
+  const params = new URLSearchParams({ granularity, ...flattenFilters(filters) })
+  const { data } = await api.get(`/dashboard/timeline/${runId}?${params}`)
+  return data
+}
+
+export async function getFilterPresets() {
+  const { data } = await api.get('/presets')
+  return data.presets || []
+}
+
+export async function saveFilterPreset(name, filters) {
+  const { data } = await api.post('/presets', { name, filters })
+  return data
+}
+
+export async function deleteFilterPreset(presetId) {
+  const { data } = await api.delete(`/presets/${presetId}`)
+  return data
+}
+
 export async function getClusters(runId, params = {}) {
-  const { data } = await api.get(`/clusters/${runId}`, { params })
+  const { data } = await api.get(`/clusters/${runId}`, { params: flattenFilters(params) })
   return data
 }
 
 export async function getAppeals(runId, params = {}) {
-  const { data } = await api.get(`/appeals/${runId}`, { params })
+  const { data } = await api.get(`/appeals/${runId}`, { params: flattenFilters(params) })
   return data
 }
 
 export async function exportAppeals(runId, filters = {}) {
-  const params = new URLSearchParams(filters)
+  const params = new URLSearchParams(flattenFilters(filters))
   const resp = await api.get(`/appeals/${runId}/export?${params}`, { responseType: 'blob' })
   const url = URL.createObjectURL(resp.data)
   const a = document.createElement('a')
@@ -67,6 +149,31 @@ export async function downloadReport(runId) {
   a.download = `report_${runId}.xlsx`
   a.click()
   URL.revokeObjectURL(url)
+}
+
+export async function getSimilar(appealId, k = 10) {
+  const { data } = await api.get(`/appeals/${appealId}/similar?k=${k}`)
+  return data
+}
+
+export async function getAlerts(runId) {
+  const { data } = await api.get(`/alerts/${runId}`)
+  return data
+}
+
+export async function getLearningQueue(runId, limit = 15) {
+  const { data } = await api.get(`/learning/${runId}/queue?limit=${limit}`)
+  return data
+}
+
+export async function getLearningStats() {
+  const { data } = await api.get('/learning/stats')
+  return data
+}
+
+export async function annotateAppeal(payload) {
+  const { data } = await api.post('/learning/annotate', payload)
+  return data
 }
 
 export async function sendChatMessage(runId, message) {

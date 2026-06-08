@@ -92,6 +92,7 @@ def _call_ollama_batch(texts: list[str], positions: list[int], categories: list[
         "model": LLM_MODEL,
         "system": system,
         "texts": [text[:350] for text in texts],
+        "groups": [(group or "") for group in groups] if groups else None,
         "positions": positions,
     }
 

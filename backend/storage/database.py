@@ -41,15 +41,35 @@ def get_sync_db():
 
 
 async def ensure_default_user():
-    """Create default user if not exists."""
+    """Create built-in users and return admin id for legacy call sites."""
     async with AsyncSessionLocal() as session:
         from sqlalchemy import select
+        from backend.config import (
+            DEFAULT_ADMIN_PASSWORD,
+            DEFAULT_ADMIN_USERNAME,
+            DEFAULT_USER_PASSWORD,
+            DEFAULT_USER_USERNAME,
+        )
+        from backend.security import hash_password
         from backend.storage.models import User
-        result = await session.execute(select(User).where(User.username == "default"))
-        user = result.scalar_one_or_none()
-        if not user:
-            user = User(username="default", role="admin")
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
-        return user.id
+
+        defaults = [
+            (DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, "admin"),
+            (DEFAULT_USER_USERNAME, DEFAULT_USER_PASSWORD, "user"),
+        ]
+        admin_user = None
+        for username, password, role in defaults:
+            result = await session.execute(select(User).where(User.username == username))
+            user = result.scalar_one_or_none()
+            if not user:
+                user = User(username=username, hashed_password=hash_password(password), role=role)
+                session.add(user)
+            else:
+                user.hashed_password = hash_password(password)
+                user.role = role
+            if role == "admin":
+                admin_user = user
+
+        await session.commit()
+        await session.refresh(admin_user)
+        return admin_user.id

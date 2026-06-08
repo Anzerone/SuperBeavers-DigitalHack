@@ -15,10 +15,28 @@ class User(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(100), unique=True, nullable=False)
     hashed_password = Column(String(255), nullable=False, default="")
-    role = Column(String(20), default="analyst")  # 'admin' | 'analyst'
+    role = Column(String(20), default="user")  # 'admin' | 'user'
     created_at = Column(DateTime, default=func.now())
 
     runs = relationship("ProcessingRun", back_populates="user")
+    filter_presets = relationship("FilterPreset", back_populates="user", cascade="all, delete-orphan")
+
+
+class FilterPreset(Base):
+    __tablename__ = "filter_presets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(120), nullable=False)
+    filters = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="filter_presets")
+
+    __table_args__ = (
+        Index("idx_filter_presets_user_name", "user_id", "name", unique=True),
+    )
 
 
 class ProcessingRun(Base):
@@ -51,6 +69,8 @@ class Appeal(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_id = Column(Integer, ForeignKey("processing_runs.id", ondelete="CASCADE"), nullable=False)
+    date_created = Column(DateTime, nullable=True)
+    date_closed = Column(DateTime, nullable=True)
     group_name = Column(String(200))       # Группа тем
     municipality = Column(String(200))     # Муниципалитет
     incident_type = Column(String(200))    # Тип инцидента
@@ -62,6 +82,8 @@ class Appeal(Base):
     confidence = Column(Float, nullable=True)
     severity = Column(String(20), nullable=True)  # CRITICAL|HIGH|MEDIUM|LOW
     category = Column(String(100), nullable=True)
+    sentiment = Column(String(20), nullable=True)  # CALM|NEUTRAL|ANGRY|DESPERATE
+    sentiment_score = Column(Float, nullable=True)  # 0..1 интенсивность негатива
     # Embedding cached as bytes (numpy tobytes)
     embedding = Column(LargeBinary, nullable=True)
 

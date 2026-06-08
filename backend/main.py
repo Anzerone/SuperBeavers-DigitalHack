@@ -1,11 +1,18 @@
 """FastAPI application entry point."""
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.api.deps import get_current_user, require_roles
 from backend.storage.database import init_db, ensure_default_user
-from backend.api.routes import upload, processing, dashboard, appeals, reports, chat
+from backend.api.routes import auth, upload, processing, dashboard, appeals, reports, chat, alerts, similarity, learning, presets
 
 
 @asynccontextmanager
@@ -37,12 +44,19 @@ app.add_middleware(
 )
 
 # Register routes
-app.include_router(upload.router, prefix="/api", tags=["upload"])
-app.include_router(processing.router, prefix="/api", tags=["processing"])
-app.include_router(dashboard.router, prefix="/api", tags=["dashboard"])
-app.include_router(appeals.router, prefix="/api", tags=["appeals"])
-app.include_router(reports.router, prefix="/api", tags=["reports"])
-app.include_router(chat.router, prefix="/api", tags=["chat"])
+auth_required = [Depends(get_current_user)]
+
+app.include_router(auth.router, prefix="/api", tags=["auth"])
+app.include_router(upload.router, prefix="/api", tags=["upload"], dependencies=auth_required)
+app.include_router(processing.router, prefix="/api", tags=["processing"], dependencies=auth_required)
+app.include_router(dashboard.router, prefix="/api", tags=["dashboard"], dependencies=auth_required)
+app.include_router(appeals.router, prefix="/api", tags=["appeals"], dependencies=auth_required)
+app.include_router(reports.router, prefix="/api", tags=["reports"], dependencies=auth_required)
+app.include_router(chat.router, prefix="/api", tags=["chat"], dependencies=auth_required)
+app.include_router(alerts.router, prefix="/api", tags=["alerts"], dependencies=auth_required)
+app.include_router(similarity.router, prefix="/api", tags=["similarity"], dependencies=auth_required)
+app.include_router(presets.router, prefix="/api", tags=["presets"], dependencies=auth_required)
+app.include_router(learning.router, prefix="/api", tags=["learning"], dependencies=[Depends(require_roles("admin"))])
 
 
 @app.get("/api/health")

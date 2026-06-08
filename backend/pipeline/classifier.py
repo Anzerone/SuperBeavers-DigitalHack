@@ -9,12 +9,52 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.preprocessing import LabelEncoder
 
-from backend.config import CATEGORIES, CLASSIFIER_CACHE_DIR, SEVERITIES
+from backend.config import (
+    CATEGORIES,
+    CLASSIFIER_CACHE_DIR,
+    EMBEDDING_LORA_PATH,
+    EMBEDDING_MAX_SEQ_LENGTH,
+    EMBEDDING_MODEL_NAME,
+    SEVERITIES,
+)
 
 logger = logging.getLogger(__name__)
 
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 CACHE_FILE = os.path.join(CLASSIFIER_CACHE_DIR, "classifier_cache.pkl")
+CACHE_FEATURE_PIPELINE = "group_prefixed_embeddings_v1"
+
+
+def _file_fingerprint(path: str) -> str:
+    if not path or not os.path.exists(path):
+        return "missing"
+    stat = os.stat(path)
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _cache_signature(categories: list[str] | None = None) -> str:
+    """Describe the embedding/features this classifier was trained on."""
+    cats = [str(category) for category in (categories or CATEGORIES)]
+    parts = [
+        f"pipeline={CACHE_FEATURE_PIPELINE}",
+        f"embedding_model={EMBEDDING_MODEL_NAME}",
+        f"max_seq_length={EMBEDDING_MAX_SEQ_LENGTH}",
+        "categories=" + "\n".join(cats),
+    ]
+    if EMBEDDING_LORA_PATH:
+        lora_path = os.path.normpath(EMBEDDING_LORA_PATH)
+        parts.append(f"lora_path={lora_path}")
+        parts.append(
+            "lora_model="
+            + _file_fingerprint(os.path.join(EMBEDDING_LORA_PATH, "model.safetensors"))
+        )
+        parts.append(
+            "lora_adapter="
+            + _file_fingerprint(os.path.join(EMBEDDING_LORA_PATH, "adapter_model.safetensors"))
+        )
+    else:
+        parts.append("lora_path=")
+    return "\n".join(parts)
 
 
 def _make_logreg():
@@ -41,13 +81,14 @@ def _fit_classifier(X: np.ndarray, y: np.ndarray):
     return clf
 
 
-def _save_cache(clf_problem, clf_severity, clf_category, le_sev, le_cat):
+def _save_cache(clf_problem, clf_severity, clf_category, le_sev, le_cat, signature: str):
     """Save trained classifiers to disk."""
     os.makedirs(CLASSIFIER_CACHE_DIR, exist_ok=True)
     with open(CACHE_FILE, "wb") as f:
         pickle.dump(
             {
                 "version": CACHE_VERSION,
+                "signature": signature,
                 "clf_problem": clf_problem,
                 "clf_severity": clf_severity,
                 "clf_category": clf_category,
@@ -59,7 +100,7 @@ def _save_cache(clf_problem, clf_severity, clf_category, le_sev, le_cat):
     logger.info("Classifier cache saved to %s", CACHE_FILE)
 
 
-def _load_cache():
+def _load_cache(signature: str):
     """Load cached classifiers. Returns None if not found or outdated."""
     if not os.path.exists(CACHE_FILE):
         return None
@@ -69,6 +110,9 @@ def _load_cache():
         if cache.get("version") != CACHE_VERSION:
             logger.info("Classifier cache version changed; rebuilding classifier")
             return None
+        if cache.get("signature") != signature:
+            logger.info("Classifier cache signature changed; rebuilding classifier")
+            return None
         logger.info("Loaded classifier from cache; skipping bootstrap")
         return cache
     except Exception as exc:
@@ -76,9 +120,9 @@ def _load_cache():
         return None
 
 
-def predict_with_cache(embeddings: np.ndarray, progress_callback=None) -> dict | None:
+def predict_with_cache(embeddings: np.ndarray, categories: list[str] | None = None, progress_callback=None) -> dict | None:
     """Try to predict using cached classifiers. Returns None if no cache."""
-    cache = _load_cache()
+    cache = _load_cache(_cache_signature(categories))
     if cache is None:
         return None
 
@@ -169,7 +213,7 @@ def train_and_predict(embeddings: np.ndarray, bootstrap: dict, categories: list[
     if progress_callback:
         progress_callback(5, 6)
 
-    _save_cache(clf_problem, clf_severity, clf_category, le_sev, le_cat)
+    _save_cache(clf_problem, clf_severity, clf_category, le_sev, le_cat, _cache_signature(cats))
     if progress_callback:
         progress_callback(6, 6)
 

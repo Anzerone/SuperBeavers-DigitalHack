@@ -4,6 +4,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 import pandas as pd
 from backend.config import COL_INDICES, EXCLUDE_INCIDENT_TYPES, EXCLUDE_OUTCOMES
+from backend.pipeline.anonymize import anonymize_text
 
 
 def _worksheet_row_count(filepath: str) -> int | None:
@@ -60,11 +61,17 @@ def load_excel(filepath: str) -> tuple[pd.DataFrame, dict]:
 
     raw_count = _worksheet_row_count(filepath) or len(df)
 
+    # Parse dates (для timeline-аналитики)
+    for date_col in ("date_created", "date_closed"):
+        if date_col in df.columns:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+
     # Clean text
     if "incident_text" in df.columns:
         df["incident_text"] = df["incident_text"].fillna("").astype(str).str.strip()
         df["incident_text"] = df["incident_text"].str.replace(r"<[^>]+>", " ", regex=True)
-        df["incident_text"] = df["incident_text"].str.replace(r"\[club\d+\|[^\]]*\]", "", regex=True)
+        # Обезличивание (упоминания, телефоны, email) + маскирование мата.
+        df["incident_text"] = df["incident_text"].map(anonymize_text)
         df["incident_text"] = df["incident_text"].str.replace(r"\s+", " ", regex=True).str.strip()
 
     # Track drops separately

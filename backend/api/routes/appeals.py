@@ -3,7 +3,7 @@ import io
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, or_
 from typing import Optional
 import openpyxl
 
@@ -14,14 +14,26 @@ from backend.storage.models import Appeal, ProblemCluster, AppealClusterMap
 router = APIRouter()
 
 
+# Разделитель мультивыбора — Unit Separator (\x1f), которого нет в значениях
+# (запятая встречается внутри значений, напр. "Омская область, другое").
+FILTER_SEP = "\x1f"
+
+
+def _multi(column, value):
+    """Условие фильтра с поддержкой мультивыбора."""
+    if not value:
+        return None
+    parts = [p.strip() for p in str(value).split(FILTER_SEP) if p.strip()]
+    if not parts:
+        return None
+    return column == parts[0] if len(parts) == 1 else column.in_(parts)
+
+
 def _build_appeal_filter(run_id, municipality, severity, category, is_problem, cluster_id):
     filters = [Appeal.run_id == run_id]
-    if municipality:
-        filters.append(Appeal.municipality == municipality)
-    if severity:
-        filters.append(Appeal.severity == severity)
-    if category:
-        filters.append(Appeal.category == category)
+    for clause in (_multi(Appeal.municipality, municipality), _multi(Appeal.severity, severity), _multi(Appeal.category, category)):
+        if clause is not None:
+            filters.append(clause)
     if is_problem is not None:
         filters.append(Appeal.is_problem == is_problem)
     if cluster_id:
@@ -48,7 +60,12 @@ async def get_appeals(
 ):
     filters = _build_appeal_filter(run_id, municipality, severity, category, is_problem, cluster_id)
     if search:
-        filters.append(Appeal.incident_text.ilike(f"%{search}%"))
+        like = f"%{search}%"
+        filters.append(or_(
+            Appeal.incident_text.ilike(like),
+            Appeal.municipality.ilike(like),
+            Appeal.category.ilike(like),
+        ))
 
     count_q = await db.execute(select(func.count()).where(and_(*filters)).select_from(Appeal))
     total = count_q.scalar()
@@ -99,14 +116,16 @@ async def get_clusters(
     db: AsyncSession = Depends(get_db),
 ):
     filters = [ProblemCluster.run_id == run_id]
-    if municipality:
-        filters.append(ProblemCluster.municipality == municipality)
-    if severity:
-        filters.append(ProblemCluster.severity == severity)
-    if category:
-        filters.append(ProblemCluster.category == category)
+    for clause in (_multi(ProblemCluster.municipality, municipality), _multi(ProblemCluster.severity, severity), _multi(ProblemCluster.category, category)):
+        if clause is not None:
+            filters.append(clause)
     if search:
-        filters.append(ProblemCluster.cluster_name.ilike(f"%{search}%"))
+        like = f"%{search}%"
+        filters.append(or_(
+            ProblemCluster.cluster_name.ilike(like),
+            ProblemCluster.municipality.ilike(like),
+            ProblemCluster.category.ilike(like),
+        ))
 
     count_q = await db.execute(select(func.count()).where(and_(*filters)).select_from(ProblemCluster))
     total = count_q.scalar()

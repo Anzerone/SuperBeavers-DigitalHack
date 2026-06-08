@@ -10,6 +10,7 @@ from sklearn.metrics.pairwise import cosine_distances
 
 from backend.config import (
     CATEGORIES,
+    CLUSTER_MERGE_DISTANCE,
     CLUSTER_NAME_CONCURRENCY,
     CLUSTER_NAME_MAX_TOTAL,
     CLUSTER_NAME_TOP_PER_MUNICIPALITY,
@@ -157,6 +158,31 @@ def _build_clusters_for_group(
         for ni, nearest_idx in zip(noise_indices, nearest):
             cluster_groups[centroid_labels[nearest_idx]].append(ni)
 
+    # Слияние кластеров-синонимов: разные DBSCAN-кластеры одного района могут
+    # описывать по сути одну и ту же проблему. Объединяем их, если центроиды
+    # ближе порога CLUSTER_MERGE_DISTANCE (union-find по парным расстояниям).
+    if CLUSTER_MERGE_DISTANCE > 0 and len(cluster_groups) > 1:
+        labels_list = list(cluster_groups.keys())
+        means = np.vstack([group_embeddings[cluster_groups[l]].mean(axis=0) for l in labels_list])
+        pair_dist = cosine_distances(means)
+        parent = list(range(len(labels_list)))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i in range(len(labels_list)):
+            for j in range(i + 1, len(labels_list)):
+                if pair_dist[i, j] < CLUSTER_MERGE_DISTANCE:
+                    parent[_find(j)] = _find(i)
+
+        merged: dict[int, list[int]] = defaultdict(list)
+        for idx, label in enumerate(labels_list):
+            merged[_find(idx)].extend(cluster_groups[label])
+        cluster_groups = merged
+
     clusters = []
     for cluster_indices in cluster_groups.values():
         c_embeddings = group_embeddings[cluster_indices]
@@ -166,7 +192,13 @@ def _build_clusters_for_group(
         c_categories = [group_categories[i] for i in cluster_indices]
         c_groups = [group_groups[i] for i in cluster_indices]
 
-        max_sev = min(c_severities, key=lambda s: SEVERITY_ORDER.get(s, 3))
+        # Тяжесть кластера = преобладающая (мода) тяжесть его обращений, а не
+        # самая высокая. Иначе один критический случай делал весь кластер
+        # «критическим», и средние/низкие кластеры вообще не появлялись.
+        sev_counts = defaultdict(int)
+        for sev in c_severities:
+            sev_counts[sev if sev in SEVERITY_ORDER else "MEDIUM"] += 1
+        max_sev = max(sev_counts, key=lambda s: (sev_counts[s], -SEVERITY_ORDER.get(s, 3)))
         cat_counts = defaultdict(int)
         for category in c_categories:
             cat_counts[category if category in cats else cats[-1]] += 1
@@ -232,7 +264,7 @@ def cluster_problems(
             )
         )
         if progress_callback:
-            progress_callback(done, max(len(groups), 1), f"Кластеризация: {done}/{len(groups)} групп")
+            progress_callback(done, max(len(groups), 1), f"GROUP {done}/{len(groups)}")
 
     # Composite ranking within each municipality
     by_muni = defaultdict(list)
@@ -278,7 +310,7 @@ def cluster_problems(
                 cluster["description"] = desc
                 named += 1
                 if progress_callback:
-                    progress_callback(done, max(len(to_name), 1), f"Именование кластеров: {done}/{len(to_name)}")
+                    progress_callback(done, max(len(to_name), 1), f"NAME {done}/{len(to_name)}")
 
     for cluster in all_clusters:
         if not cluster["cluster_name"]:

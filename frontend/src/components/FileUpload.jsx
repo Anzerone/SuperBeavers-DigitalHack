@@ -1,5 +1,23 @@
-import { useState, useRef } from 'react'
-import { uploadFile, startProcessing } from '../api.js'
+import { useEffect, useRef, useState } from 'react'
+import { getStatus, startProcessing, uploadFile } from '../api.js'
+import GovIcon from './GovIcon.jsx'
+
+const STATUS_LABELS = {
+  completed: 'Готово',
+  running: 'Обработка',
+  failed: 'Ошибка',
+  pending: 'Ожидание',
+}
+
+function restoredUpload(status) {
+  if (!status?.filename) return null
+  return {
+    filename: status.filename,
+    size_mb: null,
+    status: status.status,
+    restored: true,
+  }
+}
 
 export default function FileUpload({ runId, setRunId }) {
   const [file, setFile] = useState(null)
@@ -7,13 +25,41 @@ export default function FileUpload({ runId, setRunId }) {
   const [uploaded, setUploaded] = useState(null)
   const inputRef = useRef()
 
+  useEffect(() => {
+    if (!runId) {
+      setUploaded(null)
+      setFile(null)
+      return
+    }
+
+    let cancelled = false
+    getStatus(runId)
+      .then(status => {
+        if (cancelled) return
+        const restored = restoredUpload(status)
+        if (restored) {
+          setUploaded(prev => (
+            prev?.filename === restored.filename
+              ? { ...prev, status: restored.status }
+              : restored
+          ))
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setUploaded(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [runId])
+
   const handleUpload = async (f) => {
     setUploading(true)
     try {
       const result = await uploadFile(f)
-      setUploaded(result)
+      setUploaded({ ...result, status: 'running' })
       setFile(f)
-      // Auto-start processing
       const proc = await startProcessing(result.filepath, result.filename)
       setRunId(proc.run_id)
     } catch (e) {
@@ -29,13 +75,15 @@ export default function FileUpload({ runId, setRunId }) {
     if (f) handleUpload(f)
   }
 
+  const statusLabel = uploaded ? STATUS_LABELS[uploaded.status] || 'Загружено' : ''
+
   return (
     <div className="bg-white rounded-xl p-4 shadow-sm">
       <div className="flex items-center justify-between mb-3">
         <h3 className="font-semibold text-sm text-gray-700">Загрузка данных</h3>
         {uploaded && (
           <span className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded-full">
-            Готово
+            {statusLabel}
           </span>
         )}
       </div>
@@ -47,18 +95,20 @@ export default function FileUpload({ runId, setRunId }) {
           onClick={() => inputRef.current?.click()}
           className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center cursor-pointer hover:border-[#0d7377] transition"
         >
-          <div className="text-3xl mb-2">📄</div>
+          <GovIcon name="file" className="mx-auto mb-2 h-8 w-8 text-[#0d7377]" />
           <p className="text-sm font-medium text-gray-700">Excel с обращениями</p>
-          <p className="text-xs text-gray-400">.xlsx, до 400 000 строк</p>
+          <p className="text-xs text-gray-400">.xlsx, .xls</p>
           {uploading && <p className="text-xs text-[#0d7377] mt-2">Загрузка...</p>}
         </div>
       ) : (
         <div className="bg-gray-50 rounded-lg p-3">
           <div className="flex items-center gap-2">
-            <span className="text-lg">📎</span>
+            <GovIcon name="attachment" className="h-5 w-5 shrink-0 text-[#0d7377]" />
             <div className="min-w-0">
               <p className="text-sm font-medium truncate">{uploaded.filename}</p>
-              <p className="text-xs text-gray-400">{uploaded.size_mb} МБ</p>
+              <p className="text-xs text-gray-400">
+                {uploaded.size_mb != null ? `${uploaded.size_mb} МБ` : 'Текущая загрузка восстановлена'}
+              </p>
             </div>
           </div>
         </div>
