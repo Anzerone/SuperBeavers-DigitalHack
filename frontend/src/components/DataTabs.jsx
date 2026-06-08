@@ -4,6 +4,14 @@ import SimilarModal from './SimilarModal.jsx'
 import { SEVERITY_STYLES, formatSeverity } from '../utils/severity.js'
 import GovIcon from './GovIcon.jsx'
 
+function displayCategory(item) {
+  return item?.category || item?.group_name || 'Другое'
+}
+
+function displaySeverity(item) {
+  return item?.severity || item?.cluster_severity || 'MEDIUM'
+}
+
 // Убираем дублирование: имя кластера часто начинается с названия категории
 // ("Дороги: ..."), а категория уже показана в отдельном столбце.
 function cleanClusterName(name, category) {
@@ -18,14 +26,20 @@ function cleanClusterName(name, category) {
   return result || name || ''
 }
 
-export default function DataTabs({ runId, filters, refreshKey = 0, onExport }) {
-  const [tab, setTab] = useState('clusters')
+export default function DataTabs({ runId, filters, refreshKey = 0, onExport, activeTab, onTabChange }) {
+  const [internalTab, setInternalTab] = useState(activeTab || 'clusters')
   const [clusters, setClusters] = useState(null)
   const [appeals, setAppeals] = useState(null)
   const [clusterFilter, setClusterFilter] = useState(null)
   const [page, setPage] = useState(1)
   const [search, setSearch] = useState('')
   const [similarFor, setSimilarFor] = useState(null)
+  const tab = activeTab || internalTab
+
+  const changeTab = (nextTab) => {
+    setInternalTab(nextTab)
+    onTabChange?.(nextTab)
+  }
 
   useEffect(() => {
     setPage(1)
@@ -71,7 +85,7 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport }) {
   const goToAppeals = (clusterId) => {
     setClusterFilter(clusterId)
     setPage(1)
-    setTab('appeals')
+    changeTab('appeals')
   }
 
   return (
@@ -80,7 +94,7 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport }) {
       <div className="flex items-center justify-between px-4 pt-3 pb-0 border-b">
         <div className="flex gap-1 items-center">
           <button
-            onClick={() => { setTab('clusters'); setClusterFilter(null); setPage(1) }}
+            onClick={() => { changeTab('clusters'); setClusterFilter(null); setPage(1) }}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition ${
               tab === 'clusters' ? 'border-[#0d7377] text-[#0d7377]' : 'border-transparent text-gray-500 hover:text-gray-700'
             }`}
@@ -88,7 +102,7 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport }) {
             Кластеры проблем
           </button>
           <button
-            onClick={() => { setTab('appeals'); setPage(1) }}
+            onClick={() => { changeTab('appeals'); setPage(1) }}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition ${
               tab === 'appeals' ? 'border-[#0d7377] text-[#0d7377]' : 'border-transparent text-gray-500 hover:text-gray-700'
             }`}
@@ -149,8 +163,8 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport }) {
                       <td className="px-4 py-3 text-gray-600">{c.municipality}</td>
                       <td className="px-4 py-3 text-gray-600">{c.category}</td>
                       <td className="px-4 py-3">
-                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${SEVERITY_STYLES[c.severity] || 'bg-gray-100'}`}>
-                          {formatSeverity(c.severity, { short: true })}
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${SEVERITY_STYLES[displaySeverity(c)] || 'bg-gray-100'}`}>
+                          {formatSeverity(displaySeverity(c), { short: true })}
                         </span>
                       </td>
                       <td className="px-4 py-3 text-right font-medium">{c.appeal_count}</td>
@@ -196,13 +210,11 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport }) {
                   </td>
                   <td className="px-4 py-3 text-gray-600 whitespace-nowrap">{a.municipality}</td>
                   <td className="px-4 py-3">
-                    {a.severity && (
-                      <span className={`px-2 py-0.5 rounded text-xs font-medium ${SEVERITY_STYLES[a.severity] || 'bg-gray-100'}`}>
-                        {formatSeverity(a.severity, { short: true })}
-                      </span>
-                    )}
+                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${SEVERITY_STYLES[displaySeverity(a)] || 'bg-gray-100'}`}>
+                      {formatSeverity(displaySeverity(a), { short: true })}
+                    </span>
                   </td>
-                  <td className="px-4 py-3 text-gray-600">{a.category}</td>
+                  <td className="px-4 py-3 text-gray-600">{displayCategory(a)}</td>
                   <td className="px-4 py-3 text-gray-500">{a.outcome || ''}</td>
                   <td className="px-2 py-3">
                     <button

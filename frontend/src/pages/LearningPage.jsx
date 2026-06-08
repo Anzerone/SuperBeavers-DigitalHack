@@ -63,7 +63,6 @@ export default function LearningPage({ runId }) {
         {stats && (
           <div className="mt-3 flex gap-4 text-sm">
             <span><strong>{stats.total}</strong> уже размечено</span>
-            <span className="text-gray-400">→ файл: {stats.path}</span>
           </div>
         )}
       </div>

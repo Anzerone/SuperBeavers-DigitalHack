@@ -9,6 +9,27 @@ const STEPS = [
   { name: 'Подготовка аналитической сводки', startAt: 0.9, doneAt: 1 },
 ]
 
+const POLL_DELAY_MS = 1000
+const RETRY_DELAY_MS = 3000
+const TICK_MS = 80
+const CAP_PADDING = 0.008
+
+function clampProgress(value) {
+  return Math.max(0, Math.min(value || 0, 1))
+}
+
+function visualCapFor(progress) {
+  if (progress >= 1 - CAP_PADDING) return 1
+
+  const currentStep = STEPS.find(step => progress >= step.startAt && progress < step.doneAt)
+  if (currentStep) return Math.max(progress, currentStep.doneAt - CAP_PADDING)
+
+  const nextStep = STEPS.find(step => progress < step.startAt)
+  if (nextStep) return Math.max(progress, nextStep.startAt - CAP_PADDING)
+
+  return Math.max(progress, 1 - CAP_PADDING)
+}
+
 export default function ProcessingStatus({ runId, onComplete }) {
   const [status, setStatus] = useState(null)
   const [displayProgress, setDisplayProgress] = useState(0)
@@ -30,10 +51,10 @@ export default function ProcessingStatus({ runId, onComplete }) {
         if (nextStatus.status === 'completed') {
           onComplete?.()
         } else if (nextStatus.status === 'running') {
-          setTimeout(poll, 2000)
+          setTimeout(poll, POLL_DELAY_MS)
         }
       } catch (e) {
-        if (!cancelled) setTimeout(poll, 3000)
+        if (!cancelled) setTimeout(poll, RETRY_DELAY_MS)
       }
     }
 
@@ -45,25 +66,42 @@ export default function ProcessingStatus({ runId, onComplete }) {
 
   useEffect(() => {
     if (!status) return
-    const target = Math.max(0, Math.min(status.progress || 0, 1))
+    const target = clampProgress(status.status === 'completed' ? 1 : status.progress)
+    const cap = status.status === 'running' ? visualCapFor(target) : target
     const timer = setInterval(() => {
       setDisplayProgress((prev) => {
-        if (target < prev) return target
+        if (target < prev && status.status !== 'running') return target
         const diff = target - prev
-        if (Math.abs(diff) < 0.001) {
-          clearInterval(timer)
-          return target
+
+        if (diff > 0.001) {
+          return Math.min(target, prev + Math.max(diff * 0.24, 0.002))
         }
-        return prev + diff * 0.22
+
+        if (status.status !== 'running') {
+          if (Math.abs(diff) < 0.001) {
+            clearInterval(timer)
+            return target
+          }
+          return prev + diff * 0.24
+        }
+
+        const remaining = cap - prev
+        if (remaining <= 0.0005) {
+          clearInterval(timer)
+          return Math.max(prev, target)
+        }
+
+        return Math.min(cap, prev + Math.max(remaining * 0.004, 0.00002))
       })
-    }, 80)
+    }, TICK_MS)
 
     return () => clearInterval(timer)
   }, [status])
 
   if (!runId || !status) return null
 
-  const pct = Math.round(displayProgress * 100)
+  const displayPct = Math.max(0, Math.min(displayProgress * 100, 100))
+  const pct = Math.round(displayPct)
   const isDone = status.status === 'completed'
   const isFailed = status.status === 'failed'
 
@@ -85,7 +123,7 @@ export default function ProcessingStatus({ runId, onComplete }) {
           className={`h-full rounded-full transition-[width] duration-300 ease-out ${
             isFailed ? 'bg-red-500' : isDone ? 'bg-green-500' : 'bg-[#0d7377]'
           }`}
-          style={{ width: `${pct}%` }}
+          style={{ width: `${displayPct}%` }}
         />
       </div>
 

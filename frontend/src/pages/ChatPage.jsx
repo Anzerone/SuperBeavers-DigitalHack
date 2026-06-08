@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { exportChatResult, sendChatMessage } from '../api.js'
+import { exportChatResult, resetChat, sendChatMessage } from '../api.js'
 import GovIcon from '../components/GovIcon.jsx'
 
 function renderWithCitations(text, citations) {
@@ -38,16 +38,78 @@ const QUICK_ACTIONS = [
   'Где больше всего критических?',
 ]
 
+const TABLE_ROW_LIMIT = 50
+
+const COLUMN_LABELS = {
+  municipality: 'Район',
+  problem_count: 'Проблемных обращений',
+  appeal_count: 'Обращений',
+  rank: 'Ранг',
+  avg_rank: 'Средний ранг',
+  top_issues: 'Ключевые проблемы',
+  summary_text: 'Сводка',
+  cluster_name: 'Проблема',
+  category: 'Категория',
+  severity: 'Тяжесть',
+  centroid_text: 'Выдержка',
+  cluster_count: 'Кластеров',
+  count: 'Количество',
+  severe_count: 'Критичных и высоких',
+  muni_count: 'Муниципалитетов',
+  category_count: 'Категорий',
+  group_name: 'Группа тем',
+  incident_type: 'Тип инцидента',
+  outcome: 'Итог',
+  incident_text: 'Текст обращения',
+  confidence: 'Уверенность',
+}
+
+function labelColumn(column) {
+  return COLUMN_LABELS[column] || column
+}
+
+function formatCellValue(value) {
+  if (value == null) return ''
+  if (Array.isArray(value)) {
+    return value.map(formatCellValue).filter(Boolean).join(', ')
+  }
+  if (typeof value === 'object') {
+    if ('name' in value && 'count' in value) return `${value.name} (${value.count})`
+    if ('category' in value && 'count' in value) return `${value.category} (${value.count})`
+    const pairs = Object.entries(value)
+      .map(([key, item]) => `${labelColumn(key)}: ${formatCellValue(item)}`)
+      .filter(Boolean)
+    return pairs.join(', ')
+  }
+  return String(value)
+}
+
 export default function ChatPage({ runId }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [ctxInfo, setCtxInfo] = useState(null)
   const endRef = useRef()
+  const contextCategories = ctxInfo?.last_categories?.length
+    ? ctxInfo.last_categories
+    : ctxInfo?.last_category
+      ? [ctxInfo.last_category]
+      : []
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  const clearChat = async () => {
+    setMessages([])
+    setCtxInfo(null)
+    if (!runId) return
+    try {
+      await resetChat(runId)
+    } catch {
+      // Local cleanup is still useful if the server reset fails.
+    }
+  }
 
   const send = async (text) => {
     if (!text.trim() || !runId || loading) return
@@ -95,7 +157,7 @@ export default function ChatPage({ runId }) {
   return (
     <div className="mx-auto flex h-[calc(100vh-60px)] max-w-4xl flex-col p-4">
       {/* Context bar */}
-      {ctxInfo && (ctxInfo.last_municipality || ctxInfo.last_category) && (
+      {ctxInfo && (ctxInfo.last_municipality || contextCategories.length > 0) && (
         <div className="mb-3 flex items-center gap-2 text-xs text-gray-500">
           <span>Контекст:</span>
           {ctxInfo.last_municipality && (
@@ -104,13 +166,13 @@ export default function ChatPage({ runId }) {
               {ctxInfo.last_municipality}
             </span>
           )}
-          {ctxInfo.last_category && (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-teal-50 text-teal-700 rounded-full">
+          {contextCategories.map((category) => (
+            <span key={category} className="inline-flex items-center gap-1 px-2 py-0.5 bg-teal-50 text-teal-700 rounded-full">
               <GovIcon name="folder" className="h-3.5 w-3.5" />
-              {ctxInfo.last_category}
+              {category}
             </span>
-          )}
-          <button onClick={() => { setMessages([]); setCtxInfo(null) }} className="ml-auto text-gray-400 hover:text-gray-700 underline">
+          ))}
+          <button onClick={clearChat} className="ml-auto text-gray-400 hover:text-gray-700 underline">
             Очистить
           </button>
         </div>
@@ -164,26 +226,6 @@ export default function ChatPage({ runId }) {
                 </div>
               )}
 
-              {/* Show full fallback as collapsible details when LLM narration is shorter */}
-              {message.narration && message.fallback && message.narration !== message.fallback && (
-                <details className="mt-2">
-                  <summary className="cursor-pointer text-xs text-gray-400 hover:text-gray-600">Подробная сводка</summary>
-                  <pre className="mt-1 whitespace-pre-wrap text-xs text-gray-600 bg-gray-50 p-2 rounded">{message.fallback}</pre>
-                </details>
-              )}
-
-              {/* SQL */}
-              {message.sql && (
-                <details className="mt-2">
-                  <summary className="cursor-pointer text-xs text-gray-400 hover:text-gray-600">
-                    <span className="inline-flex items-center gap-1">
-                      SQL запрос {message.fast && <GovIcon name="energy" className="h-3.5 w-3.5 text-amber-500" />}
-                    </span>
-                  </summary>
-                  <pre className="mt-1 overflow-x-auto rounded bg-gray-50 p-2 text-xs">{message.sql}</pre>
-                </details>
-              )}
-
               {/* Data table */}
               {message.data && message.data.length > 0 && (
                 <div className="mt-3 overflow-x-auto">
@@ -192,26 +234,29 @@ export default function ChatPage({ runId }) {
                       <tr>
                         {message.columns?.map((column) => (
                           <th key={column} className="border-b px-2 py-1 text-left font-medium text-gray-500">
-                            {column}
+                            {labelColumn(column)}
                           </th>
                         ))}
                       </tr>
                     </thead>
                     <tbody>
-                      {message.data.slice(0, 10).map((row, rowIndex) => (
+                      {message.data.slice(0, TABLE_ROW_LIMIT).map((row, rowIndex) => (
                         <tr key={rowIndex} className="border-b border-gray-100 hover:bg-gray-50">
-                          {message.columns?.map((column) => (
-                            <td key={column} className="max-w-[220px] truncate px-2 py-1">
-                              {String(row[column] ?? '')}
-                            </td>
-                          ))}
+                          {message.columns?.map((column) => {
+                            const cellValue = formatCellValue(row[column])
+                            return (
+                              <td key={column} title={cellValue} className="max-w-[220px] truncate px-2 py-1">
+                                {cellValue}
+                              </td>
+                            )
+                          })}
                         </tr>
                       ))}
                     </tbody>
                   </table>
 
-                  {message.data.length > 10 && (
-                    <p className="mt-1 text-xs text-gray-400">Показано 10 из {message.data.length}</p>
+                  {message.data.length > TABLE_ROW_LIMIT && (
+                    <p className="mt-1 text-xs text-gray-400">Показано {TABLE_ROW_LIMIT} из {message.data.length}</p>
                   )}
 
                   <button

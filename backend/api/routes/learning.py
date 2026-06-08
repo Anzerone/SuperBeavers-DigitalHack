@@ -11,6 +11,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.api.display_fields import category_value, severity_value
 from backend.config import CATEGORIES, OUTPUT_DIR, SEVERITIES
 from backend.storage.database import get_db
 from backend.storage.models import Appeal
@@ -67,8 +68,8 @@ async def get_learning_queue(
             "incident_text": a.incident_text,
             "municipality": a.municipality,
             "group_name": a.group_name,
-            "predicted_category": a.category,
-            "predicted_severity": a.severity,
+            "predicted_category": category_value(a.category, a.group_name),
+            "predicted_severity": severity_value(a.severity),
             "confidence": round(a.confidence or 0, 3),
         })
         if len(queue) >= limit:
@@ -103,8 +104,8 @@ async def annotate(
         "text": appeal.incident_text,
         "group_name": appeal.group_name,
         "predicted": {
-            "category": appeal.category,
-            "severity": appeal.severity,
+            "category": category_value(appeal.category, appeal.group_name),
+            "severity": severity_value(appeal.severity),
             "is_problem": appeal.is_problem,
         },
         "annotated": {

@@ -46,16 +46,17 @@ function TimelineTooltip({ active, payload, label }) {
   )
 }
 
-export default function Timeline({ runId, filters, refreshKey = 0 }) {
+export default function Timeline({ runId, filters, refreshKey = 0, activeTab = 'appeals' }) {
   const [granularity, setGranularity] = useState('week')
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
+  const scope = activeTab === 'clusters' ? 'clusters' : 'appeals'
 
   useEffect(() => {
     if (!runId) return
     let cancelled = false
     setLoading(true)
-    getTimeline(runId, filters, granularity)
+    getTimeline(runId, filters, granularity, scope)
       .then(next => {
         if (!cancelled) setData(next)
       })
@@ -68,7 +69,7 @@ export default function Timeline({ runId, filters, refreshKey = 0 }) {
     return () => {
       cancelled = true
     }
-  }, [runId, filters, granularity, refreshKey])
+  }, [runId, filters, granularity, refreshKey, scope])
 
   const categories = data?.top_categories || []
   const categoryCount = categories.length

@@ -3,6 +3,10 @@ import { getSimilar } from '../api.js'
 import { SEVERITY_STYLES, formatSeverity } from '../utils/severity.js'
 import GovIcon from './GovIcon.jsx'
 
+function displaySeverity(item) {
+  return item?.severity || 'MEDIUM'
+}
+
 export default function SimilarModal({ appeal, onClose }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -45,21 +49,21 @@ export default function SimilarModal({ appeal, onClose }) {
           {data?.items?.length === 0 && !loading && (
             <div className="px-5 py-8 text-center text-gray-400 text-sm">Похожие не найдены</div>
           )}
-          {data?.items?.map((item, i) => (
-            <div key={item.id} className="px-5 py-3 border-b last:border-b-0 hover:bg-gray-50">
-              <div className="flex items-baseline justify-between mb-1 gap-2">
-                <div className="text-xs text-gray-500 flex items-center gap-2 flex-wrap">
+          {data?.items?.map((item, i) => {
+            const severity = displaySeverity(item)
+            return (
+              <div key={item.id} className="px-5 py-3 border-b last:border-b-0 hover:bg-gray-50">
+                <div className="flex items-baseline justify-between mb-1 gap-2">
+                  <div className="text-xs text-gray-500 flex items-center gap-2 flex-wrap">
                   <span className="font-mono">#{item.id}</span>
                   <span className="px-1.5 py-0.5 bg-teal-50 text-teal-700 rounded font-medium">
                     {(item.similarity * 100).toFixed(1)}% совп.
                   </span>
-                  {item.severity && (
-                    <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${SEVERITY_STYLES[item.severity] || ''}`}>
-                      {formatSeverity(item.severity)}
-                    </span>
-                  )}
+                  <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${SEVERITY_STYLES[severity] || ''}`}>
+                    {formatSeverity(severity)}
+                  </span>
                   <span>{item.municipality}</span>
-                  {item.category && <span className="text-gray-400">· {item.category}</span>}
+                  <span className="text-gray-400">· {item.category || item.group_name || 'Другое'}</span>
                 </div>
                 <span className="text-xs text-gray-400 shrink-0">{i + 1}</span>
               </div>
@@ -68,7 +72,8 @@ export default function SimilarModal({ appeal, onClose }) {
                 <p className="text-xs text-gray-400 mt-1">Итог: {item.outcome}</p>
               )}
             </div>
-          ))}
+            )
+          })}
         </div>
       </div>
     </div>

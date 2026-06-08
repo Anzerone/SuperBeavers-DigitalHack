@@ -17,7 +17,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.labels import format_severity
+from backend.api.display_fields import category_value, severity_value
 from backend.storage.database import get_db
 from backend.storage.models import Appeal
 
@@ -120,8 +120,8 @@ async def find_similar(
             "id": a.id,
             "similarity": round(float(sims[i]), 4),
             "municipality": a.municipality,
-            "category": a.category,
-            "severity": format_severity(a.severity) if a.severity else None,
+            "category": category_value(a.category, a.group_name),
+            "severity": severity_value(a.severity),
             "group_name": a.group_name,
             "incident_text": a.incident_text or "",
             "outcome": a.outcome,

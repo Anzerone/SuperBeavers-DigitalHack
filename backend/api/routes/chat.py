@@ -12,26 +12,31 @@ from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import CATEGORIES, LLM_MODEL, LLM_TIMEOUT_SECONDS, OLLAMA_URL
+from backend.api.display_fields import appeal_display_category, appeal_display_severity, category_value, severity_value
+from backend.api.deps import get_current_user
 from backend.labels import format_severity
 from backend.storage.database import get_db
-from backend.storage.models import Appeal
+from backend.storage.models import Appeal, User
 
 router = APIRouter()
 
-# Per-run conversation memory: history + sticky context (last muni/category)
-_conversations: dict[int, dict] = {}
+# Per-user, per-run conversation memory: history + sticky context (last muni/category)
+_conversations: dict[tuple[int, int], dict] = {}
 
 
-def _ctx(run_id: int) -> dict:
+def _ctx(run_id: int, user_id: int = 0) -> dict:
     """Get-or-create conversation context for a run."""
-    if run_id not in _conversations:
-        _conversations[run_id] = {
+    key = (run_id, user_id)
+    if key not in _conversations:
+        _conversations[key] = {
             "history": [],
             "last_municipality": None,
+            "last_municipalities": [],
             "last_category": None,
+            "last_categories": [],
             "last_severity": None,
         }
-    return _conversations[run_id]
+    return _conversations[key]
 
 
 SYSTEM_PROMPT = """Ты - аналитик обращений граждан Омской области. У тебя есть БД PostgreSQL.
@@ -99,6 +104,34 @@ ALIASES = {
     "Ветеринария": ["ветеринар", "животн", "собак", "кошк", "бродяч"],
     "Другое": ["другое", "прочее"],
 }
+
+CHAT_COLUMN_LABELS = {
+    "municipality": "Район",
+    "problem_count": "Проблемных обращений",
+    "appeal_count": "Обращений",
+    "rank": "Ранг",
+    "avg_rank": "Средний ранг",
+    "top_issues": "Ключевые проблемы",
+    "summary_text": "Сводка",
+    "cluster_name": "Проблема",
+    "category": "Категория",
+    "severity": "Тяжесть",
+    "centroid_text": "Выдержка",
+    "cluster_count": "Кластеров",
+    "count": "Количество",
+    "severe_count": "Критичных и высоких",
+    "muni_count": "Муниципалитетов",
+    "category_count": "Категорий",
+    "group_name": "Группа тем",
+    "incident_type": "Тип инцидента",
+    "outcome": "Итог",
+    "incident_text": "Текст обращения",
+    "confidence": "Уверенность",
+}
+
+
+def _label_column(column: str) -> str:
+    return CHAT_COLUMN_LABELS.get(column, column)
 
 
 async def _call_ollama(prompt: str, system: str = "", timeout: int = 45, temperature: float = 0.1) -> str:
@@ -169,6 +202,22 @@ def _has_follow_up_marker(message: str) -> bool:
     return bool(re.search(r"\b(а\s+(что|как|там|по|где|сколько|у)|и\s+(там|по)|еще|ещё|подробне|расскажи больше|развернут)\b", norm))
 
 
+def _contains_any(norm: str, terms: list[str]) -> bool:
+    return any(term in norm for term in terms)
+
+
+def _asks_for_compare(norm: str) -> bool:
+    return _contains_any(norm, ["сравн", "по сравнению", "разниц", "отлич", "между"])
+
+
+def _asks_for_districts(norm: str) -> bool:
+    return _contains_any(norm, ["по районам", "район", "муниципал", "территор", "где"])
+
+
+def _asks_for_top(norm: str) -> bool:
+    return _contains_any(norm, ["топ", "рейтинг", "самые проблем", "лидер", "хуже всего", "больше всего"])
+
+
 async def _known_municipalities(db: AsyncSession, run_id: int) -> list[str]:
     result = await db.execute(
         text("""
@@ -200,42 +249,77 @@ async def _detect_municipality(db: AsyncSession, run_id: int, message: str) -> s
     return found[0] if found else None
 
 
-def _append_filters(where: list[str], params: dict[str, Any], category: str | None, severity: str | None):
-    if category:
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if item]
+    return [value] if value else []
+
+
+def _append_filters(where: list[str], params: dict[str, Any], category: str | list[str] | None, severity: str | None):
+    categories = _as_list(category)
+    if len(categories) == 1:
         where.append("category = :category")
-        params["category"] = category
+        params["category"] = categories[0]
+    elif categories:
+        where.append("category = ANY(:categories)")
+        params["categories"] = categories
     if severity:
         where.append("severity = :severity")
         params["severity"] = severity
 
 
-async def _fast_intent(message: str, run_id: int, db: AsyncSession) -> tuple[str, dict[str, Any], str] | None:
+async def _fast_intent(message: str, run_id: int, db: AsyncSession, user_id: int = 0) -> tuple[str, dict[str, Any], str] | None:
     norm = _normalize(message)
-    ctx = _ctx(run_id)
+    ctx = _ctx(run_id, user_id)
     limit = _detect_limit(message)
     category = _detect_category(message)
     severity = _detect_severity(message)
     municipality = await _detect_municipality(db, run_id, message)
     all_categories = _detect_categories_all(message)
     all_munis = await _detect_municipalities_all(db, run_id, message)
+    asks_compare = _asks_for_compare(norm)
+    asks_districts = _asks_for_districts(norm)
+    asks_top = _asks_for_top(norm)
+    explicit_category = category
+    explicit_severity = severity
+    explicit_municipality = municipality
+    category_filter: str | list[str] | None = category
 
     # Follow-up resolution: use sticky context
-    if _has_follow_up_marker(message) or (not municipality and not category and not severity):
-        if not municipality and ctx.get("last_municipality"):
+    if _has_follow_up_marker(message) or (not explicit_municipality and not explicit_category and not explicit_severity):
+        if not category:
+            saved_categories = _as_list(ctx.get("last_categories"))
+            if saved_categories:
+                category_filter = saved_categories
+                category = saved_categories[0] if len(saved_categories) == 1 else None
+            elif ctx.get("last_category"):
+                category = ctx["last_category"]
+                category_filter = category
+        if not municipality and not asks_districts and ctx.get("last_municipality"):
             municipality = ctx["last_municipality"]
-        if not category and ctx.get("last_category"):
-            category = ctx["last_category"]
+
+    categories_in_filter = _as_list(category_filter)
+    has_category_filter = bool(categories_in_filter)
 
     # Update sticky context
     if municipality:
         ctx["last_municipality"] = municipality
-    if category:
-        ctx["last_category"] = category
+    if explicit_category:
+        ctx["last_category"] = explicit_category
+        ctx["last_categories"] = [explicit_category]
+    elif categories_in_filter:
+        ctx["last_category"] = categories_in_filter[0] if len(categories_in_filter) == 1 else None
+        ctx["last_categories"] = categories_in_filter
     if severity:
         ctx["last_severity"] = severity
 
     # === COMPARISON: две категории или два района ===
-    if len(all_categories) >= 2:
+    if asks_compare and len(all_categories) >= 2:
+        compared_categories = all_categories[:5]
+        ctx["last_category"] = None
+        ctx["last_categories"] = compared_categories
         return (
             """
             SELECT category, COUNT(*) AS problem_count,
@@ -245,11 +329,11 @@ async def _fast_intent(message: str, run_id: int, db: AsyncSession) -> tuple[str
             WHERE run_id = :run_id AND is_problem = true AND category = ANY(:cats)
             GROUP BY category
             """,
-            {"run_id": run_id, "cats": all_categories[:5]},
+            {"run_id": run_id, "cats": compared_categories},
             "category_compare",
         )
 
-    if len(all_munis) >= 2:
+    if asks_compare and len(all_munis) >= 2:
         return (
             """
             SELECT municipality, problem_count, ROUND(avg_rank::numeric, 1) AS avg_rank, top_issues
@@ -265,7 +349,7 @@ async def _fast_intent(message: str, run_id: int, db: AsyncSession) -> tuple[str
     if asks_severity_breakdown and not severity:
         where = ["run_id = :run_id", "is_problem = true", "severity IS NOT NULL"]
         params: dict[str, Any] = {"run_id": run_id, "limit": limit}
-        _append_filters(where, params, category, None)
+        _append_filters(where, params, category_filter, None)
         return (
             f"""
             SELECT municipality, severity, COUNT(*) AS count
@@ -281,10 +365,10 @@ async def _fast_intent(message: str, run_id: int, db: AsyncSession) -> tuple[str
 
     # === COUNT ===
     asks_count = any(term in norm for term in ["сколько", "количество", "число "])
-    if asks_count and (category or severity) and not municipality:
+    if asks_count and (has_category_filter or severity) and not municipality:
         where = ["run_id = :run_id", "is_problem = true"]
         params = {"run_id": run_id}
-        _append_filters(where, params, category, severity)
+        _append_filters(where, params, category_filter, severity)
         return (
             f"""
             SELECT COUNT(*) AS problem_count
@@ -296,9 +380,32 @@ async def _fast_intent(message: str, run_id: int, db: AsyncSession) -> tuple[str
             "count",
         )
 
+    # === CATEGORY SUMMARY across districts ===
+    if has_category_filter and not municipality and (asks_districts or asks_top or "сводк" in norm or "распредел" in norm):
+        where = ["run_id = :run_id", "is_problem = true"]
+        district_limit = limit if asks_top else 50
+        params = {"run_id": run_id, "limit": district_limit}
+        _append_filters(where, params, category_filter, severity)
+        return (
+            f"""
+            SELECT municipality,
+                   COUNT(*) AS problem_count,
+                   COUNT(*) FILTER (WHERE severity IN ('CRITICAL','HIGH')) AS severe_count,
+                   COUNT(DISTINCT category) AS category_count
+            FROM appeals
+            WHERE {' AND '.join(where)}
+            GROUP BY municipality
+            ORDER BY problem_count DESC
+            LIMIT :limit
+            """,
+            params,
+            "category_summary",
+        )
+
     # === TOP DISTRICTS ===
-    asks_top_districts = any(term in norm for term in ["топ", "рейтинг", "самые проблем", "лидер", "хуже всего"]) and any(term in norm for term in ["район", "муниципалит", "област"])
+    asks_top_districts = asks_top and _contains_any(norm, ["район", "муниципалит", "област"])
     if asks_top_districts:
+        district_limit = limit if asks_top else 50
         return (
             """
             SELECT municipality, problem_count, ROUND(avg_rank::numeric, 1) AS avg_rank, top_issues, summary_text
@@ -307,7 +414,20 @@ async def _fast_intent(message: str, run_id: int, db: AsyncSession) -> tuple[str
             ORDER BY rank
             LIMIT :limit
             """,
-            {"run_id": run_id, "limit": limit},
+            {"run_id": run_id, "limit": district_limit},
+            "district_top",
+        )
+
+    if asks_districts and not municipality and not has_category_filter:
+        return (
+            """
+            SELECT municipality, problem_count, ROUND(avg_rank::numeric, 1) AS avg_rank, top_issues, summary_text
+            FROM summaries
+            WHERE run_id = :run_id
+            ORDER BY rank
+            LIMIT :limit
+            """,
+            {"run_id": run_id, "limit": 50},
             "district_top",
         )
 
@@ -315,7 +435,7 @@ async def _fast_intent(message: str, run_id: int, db: AsyncSession) -> tuple[str
     if municipality:
         where = ["run_id = :run_id", "municipality = :municipality"]
         params = {"run_id": run_id, "municipality": municipality, "limit": 50}
-        _append_filters(where, params, category, severity)
+        _append_filters(where, params, category_filter, severity)
         return (
             f"""
             SELECT cluster_name, appeal_count, rank, category, severity, centroid_text
@@ -329,10 +449,10 @@ async def _fast_intent(message: str, run_id: int, db: AsyncSession) -> tuple[str
         )
 
     # === CATEGORY SUMMARY across districts ===
-    if category and any(term in norm for term in ["сводк", "район", "где", "топ"]):
+    if has_category_filter and any(term in norm for term in ["сводк", "район", "где", "топ"]):
         where = ["run_id = :run_id"]
         params = {"run_id": run_id, "limit": limit}
-        _append_filters(where, params, category, severity)
+        _append_filters(where, params, category_filter, severity)
         return (
             f"""
             SELECT municipality, SUM(appeal_count) AS problem_count, COUNT(*) AS cluster_count
@@ -346,10 +466,10 @@ async def _fast_intent(message: str, run_id: int, db: AsyncSession) -> tuple[str
             "category_summary",
         )
 
-    if category or severity:
+    if has_category_filter or severity:
         where = ["run_id = :run_id"]
         params = {"run_id": run_id, "limit": 50}
-        _append_filters(where, params, category, severity)
+        _append_filters(where, params, category_filter, severity)
         return (
             f"""
             SELECT municipality, cluster_name, appeal_count, rank, category, severity, centroid_text
@@ -427,6 +547,8 @@ def _serialize_data(data: list[dict]) -> list[dict]:
 
 
 def _display_value(key: str, value: Any) -> Any:
+    if key == "top_issues":
+        return _format_top_issues(value)
     if key == "severity":
         return format_severity(value)
     if isinstance(value, str) and value in {"CRITICAL", "HIGH", "MEDIUM", "LOW"}:
@@ -464,70 +586,37 @@ def _make_answer(kind: str, data: list[dict], message: str) -> str:
     if kind == "count":
         row = data[0]
         count = row.get("problem_count", 0)
-        return f"Найдено {count} обращений по запросу."
+        return f"Найдено {count} обращений по запросу. Значение показано в таблице ниже."
 
     if kind == "category_compare":
-        lines = ["Сравнение категорий:"]
-        for row in data:
-            lines.append(
-                f"• {row.get('category')}: {row.get('problem_count')} проблем, "
-                f"из них {row.get('severe_count')} крит./высок., "
-                f"затронуто {row.get('muni_count')} муниципалитетов"
-            )
-        return "\n".join(lines)
+        return f"Сравнение категорий готово: {len(data)} строк. Количество проблем, тяжелые обращения и охват по районам — в таблице ниже."
 
     if kind == "muni_compare":
-        lines = ["Сравнение районов:"]
-        for row in data:
-            issues = _format_top_issues(row.get("top_issues"))
-            lines.append(
-                f"• {row.get('municipality')}: {row.get('problem_count')} обращений, "
-                f"средний ранг {row.get('avg_rank')}. Ключевые: {issues}"
-            )
-        return "\n".join(lines)
+        return f"Сравнение районов готово: {len(data)} строк. Количество обращений, средний ранг и ключевые проблемы — в таблице ниже."
 
     if kind == "severity_by_muni":
-        lines = ["Разбивка по тяжести:"]
-        for row in data:
-            lines.append(f"• {row.get('municipality')} — {format_severity(row.get('severity'))}: {row.get('count')}")
-        return "\n".join(lines)
+        return f"Разбивка по тяжести готова: {len(data)} строк. Районы, уровни тяжести и количество обращений — в таблице ниже."
 
     if kind == "district_top":
-        lines = ["Топ районов по проблемным обращениям:"]
-        for idx, row in enumerate(data, 1):
-            issues = _format_top_issues(row.get("top_issues"))
-            avg_rank = row.get("avg_rank")
-            suffix = f", средний ранг {avg_rank}" if avg_rank is not None else ""
-            issue_part = f". Ключевые проблемы: {issues}" if issues else ""
-            lines.append(f"{idx}. {row.get('municipality')}: {row.get('problem_count')} обращений{suffix}{issue_part}")
-        return "\n".join(lines)
+        return f"Сформировал список районов: {len(data)} строк. Ранг, количество обращений и ключевые проблемы — в таблице ниже."
 
     if kind == "category_summary":
-        lines = ["Сводка по категории:"]
-        for idx, row in enumerate(data, 1):
-            lines.append(f"{idx}. {row.get('municipality')}: {row.get('problem_count')} обращений, {row.get('cluster_count')} кластеров")
-        return "\n".join(lines)
+        return f"Сформировал сводку по категории: {len(data)} строк. Районы, количество обращений и критичные/высокие случаи — в таблице ниже."
 
-    lines = ["Найденные проблемы:"]
-    for idx, row in enumerate(data[:10], 1):
-        muni = row.get("municipality")
-        muni_prefix = f"{muni}: " if muni else ""
-        name = row.get("cluster_name", "Проблема")
-        count = row.get("appeal_count")
-        rank = row.get("rank")
-        category = row.get("category")
-        severity = format_severity(row.get("severity")) if row.get("severity") else None
-        excerpt = " ".join(str(row.get("centroid_text") or "").split())[:180]
-        meta = ", ".join(str(item) for item in [category, severity, f"ранг {rank}" if rank else None] if item)
-        lines.append(f"{idx}. {muni_prefix}{name} - {count} обращений ({meta}).")
-        if excerpt:
-            lines.append(f"   Выдержка: {excerpt}")
-    if len(data) > 10:
-        lines.append(f"Показано 10 из {len(data)} строк. Полную таблицу можно скачать в XLSX.")
-    return "\n".join(lines)
+    if kind == "municipality_problems":
+        return f"Нашёл проблемы по выбранному району: {len(data)} строк. Названия кластеров, количество обращений, категория и тяжесть — в таблице ниже."
+
+    return f"Нашёл проблемные кластеры по запросу: {len(data)} строк. Районы, темы, количество обращений, тяжесть и выдержки — в таблице ниже."
 
 
-async def _fetch_citations(db: AsyncSession, run_id: int, data: list[dict], limit: int = 3) -> list[dict]:
+async def _fetch_citations(
+    db: AsyncSession,
+    run_id: int,
+    data: list[dict],
+    limit: int = 3,
+    category: str | list[str] | None = None,
+    severity: str | None = None,
+) -> list[dict]:
     """Подтянуть 3 конкретных обращения для цитирования по результатам запроса.
 
     Стратегия: если в результатах есть municipality+category — берём оттуда
@@ -538,32 +627,38 @@ async def _fetch_citations(db: AsyncSession, run_id: int, data: list[dict], limi
 
     munis = list({row.get("municipality") for row in data if row.get("municipality")})[:3]
     cats = list({row.get("category") for row in data if row.get("category")})[:3]
+    context_cats = _as_list(category)
+    if context_cats and not cats:
+        cats = context_cats[:3]
 
     if not munis and not cats:
         return []
 
+    display_category = appeal_display_category().label("display_category")
+    display_severity = appeal_display_severity().label("display_severity")
     conds = [Appeal.run_id == run_id, Appeal.is_problem == True]
     if munis:
         conds.append(Appeal.municipality.in_(munis))
     if cats:
-        conds.append(Appeal.category.in_(cats))
+        conds.append(display_category.in_(cats))
+    if severity:
+        conds.append(display_severity == severity)
 
     res = await db.execute(
-        select(Appeal)
+        select(Appeal, display_category, display_severity)
         .where(and_(*conds))
         .order_by(Appeal.confidence.desc().nullslast())
         .limit(limit)
     )
-    appeals = res.scalars().all()
     return [
         {
             "id": a.id,
             "text": (a.incident_text or "")[:400],
             "municipality": a.municipality,
-            "category": a.category,
-            "severity": a.severity,
+            "category": category_value(display_category),
+            "severity": severity_value(display_severity),
         }
-        for a in appeals
+        for a, display_category, display_severity in res.all()
     ]
 
 
@@ -661,10 +756,15 @@ def _suggestions(kind: str, data: list[dict], ctx: dict) -> list[str]:
 
 
 @router.post("/chat")
-async def chat(run_id: int, message: str, db: AsyncSession = Depends(get_db)):
+async def chat(
+    run_id: int,
+    message: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Chat with processed data: fast intent → LLM narration → suggestions."""
-    ctx = _ctx(run_id)
-    fast = await _fast_intent(message, run_id, db)
+    ctx = _ctx(run_id, current_user.id)
+    fast = await _fast_intent(message, run_id, db, current_user.id)
     if fast:
         sql, params, kind = fast
         try:
@@ -675,15 +775,18 @@ async def chat(run_id: int, message: str, db: AsyncSession = Depends(get_db)):
         serialized = _serialize_data(data)
         display_data = _display_data(serialized)
 
-        # RAG: подтягиваем реальные обращения для цитирования
-        citations = await _fetch_citations(db, run_id, serialized, limit=3)
-        narration = (
-            await _narrate_with_rag(message, kind, serialized, citations)
-            if citations
-            else await _narrate(message, kind, serialized)
+        # Keep citations, but answer deterministic fast intents from the SQL result.
+        citations = await _fetch_citations(
+            db,
+            run_id,
+            serialized,
+            limit=3,
+            category=ctx.get("last_categories") or ctx.get("last_category"),
+            severity=ctx.get("last_severity"),
         )
+        narration = None
         fallback = _make_answer(kind, serialized, message)
-        answer = narration or fallback
+        answer = fallback
 
         suggestions = _suggestions(kind, serialized, ctx)
         entry = {"question": message, "answer": answer, "sql": sql, "data": display_data, "citations": citations}
@@ -704,6 +807,7 @@ async def chat(run_id: int, message: str, db: AsyncSession = Depends(get_db)):
             "context": {
                 "last_municipality": ctx.get("last_municipality"),
                 "last_category": ctx.get("last_category"),
+                "last_categories": ctx.get("last_categories", []),
                 "last_severity": ctx.get("last_severity"),
             },
         }
@@ -762,9 +866,9 @@ async def chat(run_id: int, message: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/chat/export")
-async def export_chat_result(run_id: int):
+async def export_chat_result(run_id: int, current_user: User = Depends(get_current_user)):
     """Export the last chat result table as Excel."""
-    history = _ctx(run_id).get("history", [])
+    history = _ctx(run_id, current_user.id).get("history", [])
     if not history:
         raise HTTPException(404, "No chat history")
 
@@ -782,7 +886,7 @@ async def export_chat_result(run_id: int):
 
     data = last["data"]
     headers = list(data[0].keys())
-    ws.append(headers)
+    ws.append([_label_column(header) for header in headers])
     for row in data:
         ws.append([str(row.get(header, "")) for header in headers])
 
@@ -798,7 +902,7 @@ async def export_chat_result(run_id: int):
 
 
 @router.post("/chat/reset")
-async def reset_chat(run_id: int):
+async def reset_chat(run_id: int, current_user: User = Depends(get_current_user)):
     """Сбросить контекст разговора."""
-    _conversations.pop(run_id, None)
+    _conversations.pop((run_id, current_user.id), None)
     return {"ok": True}

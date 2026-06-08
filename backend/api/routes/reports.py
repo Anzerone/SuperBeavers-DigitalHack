@@ -15,6 +15,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.api.display_fields import appeal_display_category, appeal_display_severity, category_value, severity_value
 from backend.labels import format_severity
 from backend.storage.database import get_db
 from backend.storage.models import Appeal, ProblemCluster, ProcessingRun, Summary
@@ -123,12 +124,13 @@ def _problem_name(name: str | None, category: str | None = None, description: st
 
 
 def _cluster_issue(cluster: ProblemCluster) -> dict:
+    severity = severity_value(cluster.severity)
     return {
         "name": _problem_name(cluster.cluster_name, cluster.category, cluster.description),
         "count": cluster.appeal_count or 0,
-        "category": cluster.category,
-        "severity": cluster.severity,
-        "severity_label": format_severity(cluster.severity),
+        "category": category_value(cluster.category),
+        "severity": severity,
+        "severity_label": format_severity(severity),
         "centroid_excerpt": cluster.centroid_text or "",
     }
 
@@ -140,12 +142,13 @@ def _top_issues_for_summary(summary: Summary, clusters_by_muni: dict[str, list[P
         return [_cluster_issue(cluster) for cluster in sorted_clusters[:3]]
     out = []
     for issue in (summary.top_issues or [])[:3]:
+        severity = severity_value(issue.get("severity"))
         out.append({
             "name": _problem_name(issue.get("name"), issue.get("category"), issue.get("description")),
             "count": issue.get("count", 0),
-            "category": issue.get("category"),
-            "severity": issue.get("severity"),
-            "severity_label": format_severity(issue.get("severity")),
+            "category": category_value(issue.get("category")),
+            "severity": severity,
+            "severity_label": format_severity(severity),
             "centroid_excerpt": issue.get("centroid_excerpt", ""),
         })
     return out
@@ -196,26 +199,28 @@ async def download_report(run_id: int, db: AsyncSession = Depends(get_db)):
     for cluster in all_clusters:
         clusters_by_muni[cluster.municipality].append(cluster)
 
+    display_severity = appeal_display_severity()
+    display_category = appeal_display_category()
+
     # Severity counts per municipality
     sev_per_muni_q = await db.execute(
         select(
             Appeal.municipality,
-            Appeal.severity,
+            display_severity.label("severity"),
             func.count().label("cnt"),
         )
         .where(and_(Appeal.run_id == run_id, Appeal.is_problem == True))
-        .group_by(Appeal.municipality, Appeal.severity)
+        .group_by(Appeal.municipality, display_severity)
     )
     sev_per_muni: dict[str, dict[str, int]] = defaultdict(lambda: {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0})
     for muni, sev, cnt in sev_per_muni_q.all():
-        if sev:
-            sev_per_muni[muni][sev] = cnt
+        sev_per_muni[muni][severity_value(sev)] = cnt
 
     # Category counts
     category_q = await db.execute(
-        select(Appeal.category, func.count().label("count"))
-        .where(and_(Appeal.run_id == run_id, Appeal.is_problem == True, Appeal.category.isnot(None)))
-        .group_by(Appeal.category)
+        select(display_category.label("category"), func.count().label("count"))
+        .where(and_(Appeal.run_id == run_id, Appeal.is_problem == True))
+        .group_by(display_category)
         .order_by(func.count().desc())
         .limit(10)
     )
@@ -223,14 +228,13 @@ async def download_report(run_id: int, db: AsyncSession = Depends(get_db)):
 
     # Global severity distribution
     global_sev_q = await db.execute(
-        select(Appeal.severity, func.count().label("cnt"))
+        select(display_severity.label("severity"), func.count().label("cnt"))
         .where(and_(Appeal.run_id == run_id, Appeal.is_problem == True))
-        .group_by(Appeal.severity)
+        .group_by(display_severity)
     )
     global_sev = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for sev, cnt in global_sev_q.all():
-        if sev in global_sev:
-            global_sev[sev] = cnt
+        global_sev[severity_value(sev)] = cnt
 
     # Critical hotspots — top critical clusters
     critical_clusters = sorted(
@@ -332,16 +336,17 @@ def _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_cluste
         row += 1
 
         for idx, c in enumerate(critical_clusters, 1):
+            severity = severity_value(c.severity)
             ws.cell(row=row, column=1, value=idx)
             ws.cell(row=row, column=2, value=c.municipality)
             ws.cell(row=row, column=3, value=_problem_name(c.cluster_name, c.category, c.description))
             ws.cell(row=row, column=4, value=c.appeal_count)
-            ws.cell(row=row, column=5, value=format_severity(c.severity))
+            ws.cell(row=row, column=5, value=format_severity(severity))
             quote = _compact_text(c.centroid_text or "")[:200]
             ws.cell(row=row, column=6, value=f"«{quote}»" if quote else "")
             ws.cell(row=row, column=6).font = QUOTE_FONT
             _style_data_row(ws, row, len(headers), zebra=(idx % 2 == 0))
-            _color_severity_cell(ws.cell(row=row, column=5), c.severity)
+            _color_severity_cell(ws.cell(row=row, column=5), severity)
             row += 1
     else:
         ws.cell(row=row, column=1, value="Критических очагов не выявлено")
@@ -551,16 +556,17 @@ def _build_top3_sheet(wb, summaries, clusters_by_muni):
 
         data_start = row
         for idx, cluster in enumerate(clusters, 1):
+            severity = severity_value(cluster.severity)
             ws.cell(row=row, column=1, value=cluster.rank or idx)
             ws.cell(row=row, column=2, value=_problem_name(cluster.cluster_name, cluster.category, cluster.description))
             ws.cell(row=row, column=3, value=cluster.appeal_count)
-            ws.cell(row=row, column=4, value=format_severity(cluster.severity))
+            ws.cell(row=row, column=4, value=format_severity(severity))
             quote = _compact_text(cluster.centroid_text or "")[:400]
             ws.cell(row=row, column=5, value=f"«{quote}»" if quote else "")
             ws.cell(row=row, column=5).font = QUOTE_FONT
 
             _style_data_row(ws, row, len(detail_headers), zebra=(idx % 2 == 0))
-            _color_severity_cell(ws.cell(row=row, column=4), cluster.severity)
+            _color_severity_cell(ws.cell(row=row, column=4), severity)
             row += 1
 
         # Conditional formatting on "Обращений" within this block

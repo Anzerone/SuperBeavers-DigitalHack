@@ -26,6 +26,7 @@ from backend.config import (
     SEVERITY_WEIGHTS,
 )
 from backend.pipeline.llm_utils import get_cached_llm, parse_llm_json, set_cached_llm
+from backend.problem_naming import fallback_problem_name
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +43,9 @@ def _find_centroid(embeddings: np.ndarray, texts: list[str]) -> tuple[int, str]:
 
 
 def _fallback_name(category: str, centroid_text: str, categories: list[str] | None = None) -> str:
-    cats = categories or CATEGORIES
-    category = category if category in cats else cats[-1]
-    excerpt = " ".join((centroid_text or "").split())[:80]
-    if excerpt:
-        return f"{category}: {excerpt}..."
-    return f"Проблема ({category})"
+    # Группировочное имя без цитаты — кластеры без LLM-разметки получают
+    # обобщённый ярлык по категории, а не сырую цитату гражданина.
+    return fallback_problem_name(category, centroid_text, categories=categories or CATEGORIES)
 
 
 def _name_cluster_llm(cluster: dict) -> tuple[str, str]:
@@ -192,19 +190,40 @@ def _build_clusters_for_group(
         c_categories = [group_categories[i] for i in cluster_indices]
         c_groups = [group_groups[i] for i in cluster_indices]
 
-        # Тяжесть кластера = преобладающая (мода) тяжесть его обращений, а не
-        # самая высокая. Иначе один критический случай делал весь кластер
-        # «критическим», и средние/низкие кластеры вообще не появлялись.
+        # Тяжесть кластера = тяжесть центроида (наиболее типичного обращения),
+        # с двумя страховками:
+        #   1) Эскалация: если ≥40% обращений CRITICAL — повышаем до CRITICAL
+        #      (даже если центроид не критический). Защищает от того, что
+        #      крупный «средний» кластер скрывает массу реальных аварий.
+        #   2) Демпфер: если центроид CRITICAL, но <30% обращений CRITICAL —
+        #      понижаем до мажоритарной (моды) severity. Защищает от ложно-
+        #      положительного CRITICAL у нерепрезентативного центроида.
+        centroid_idx, centroid_text = _find_centroid(c_embeddings, c_texts)
+        centroid_sev = c_severities[centroid_idx] if centroid_idx < len(c_severities) else "MEDIUM"
+        if centroid_sev not in SEVERITY_ORDER:
+            centroid_sev = "MEDIUM"
+
         sev_counts = defaultdict(int)
         for sev in c_severities:
             sev_counts[sev if sev in SEVERITY_ORDER else "MEDIUM"] += 1
-        max_sev = max(sev_counts, key=lambda s: (sev_counts[s], -SEVERITY_ORDER.get(s, 3)))
+        total = sum(sev_counts.values()) or 1
+        critical_share = sev_counts.get("CRITICAL", 0) / total
+        centroid_share = sev_counts.get(centroid_sev, 0) / total
+
+        mode_sev = max(sev_counts, key=lambda s: (sev_counts[s], -SEVERITY_ORDER.get(s, 3)))
+
+        if critical_share >= 0.40:
+            max_sev = "CRITICAL"
+        elif centroid_sev == "CRITICAL" and critical_share < 0.30:
+            max_sev = mode_sev
+        else:
+            max_sev = centroid_sev if centroid_share >= 0.25 else mode_sev
         cat_counts = defaultdict(int)
         for category in c_categories:
             cat_counts[category if category in cats else cats[-1]] += 1
         top_category = max(cat_counts, key=cat_counts.get)
 
-        _, centroid_text = _find_centroid(c_embeddings, c_texts)
+        # centroid_text уже посчитан выше (вместе с centroid_idx)
         example_texts = [text[:300] for text in c_texts[:5]]
         topic_groups = set(g for g in c_groups if g)
 
@@ -316,10 +335,112 @@ def cluster_problems(
         if not cluster["cluster_name"]:
             cluster["cluster_name"] = _fallback_name(cluster["category"], cluster["centroid_text"], cats)[:200]
 
+    # Dedupe: merge clusters with the same (municipality, cluster_name).
+    # DBSCAN may split semantically similar texts into separate clusters,
+    # which LLM then names identically — that creates visible duplicates
+    # with different severity ratings. Merge them back into one cluster.
+    before_dedupe = len(all_clusters)
+    all_clusters = _dedupe_clusters_by_name(all_clusters)
+    after_dedupe = len(all_clusters)
+
+    # Re-rank after dedupe (composite score)
+    by_muni_post = defaultdict(list)
+    for cluster in all_clusters:
+        by_muni_post[cluster["municipality"]].append(cluster)
+
+    for muni_clusters in by_muni_post.values():
+        if not muni_clusters:
+            continue
+        max_appeals = max(c["appeal_count"] for c in muni_clusters)
+        max_diversity = max((c["topic_diversity"] for c in muni_clusters), default=1) or 1
+        for c in muni_clusters:
+            norm_appeals = c["appeal_count"] / max_appeals if max_appeals else 0
+            norm_diversity = c["topic_diversity"] / max_diversity if max_diversity else 0
+            sev_weight = SEVERITY_WEIGHTS.get(c["severity"], 0.25)
+            c["rank_score"] = (
+                RANK_WEIGHT_APPEALS * norm_appeals
+                + RANK_WEIGHT_TOPIC_DIVERSITY * norm_diversity
+                + RANK_WEIGHT_SEVERITY * sev_weight
+            )
+        muni_clusters.sort(key=lambda c: -c["rank_score"])
+        for rank, c in enumerate(muni_clusters, 1):
+            c["rank"] = rank
+
     logger.info(
-        "Created %s clusters across %s DBSCAN groups, named %s via LLM",
-        len(all_clusters),
+        "Created %s clusters across %s DBSCAN groups, named %s via LLM, merged %s duplicates",
+        after_dedupe,
         len(groups),
         named,
+        before_dedupe - after_dedupe,
     )
     return all_clusters
+
+
+def _dedupe_clusters_by_name(clusters: list[dict]) -> list[dict]:
+    """Merge clusters sharing the same (municipality, cluster_name).
+
+    Aggregates appeal_count/appeal_ids/severity/category from all duplicates.
+    Severity is recomputed by weighted-mode with the same 40% CRITICAL threshold.
+    """
+    groups = defaultdict(list)
+    for cluster in clusters:
+        name_key = " ".join((cluster.get("cluster_name") or "").lower().split())
+        # If name is empty (fallback failed), don't merge — keep separate
+        if not name_key:
+            groups[(cluster["municipality"], id(cluster))].append(cluster)
+            continue
+        groups[(cluster["municipality"], name_key)].append(cluster)
+
+    merged = []
+    for group_clusters in groups.values():
+        if len(group_clusters) == 1:
+            merged.append(group_clusters[0])
+            continue
+
+        # Sort by appeal_count desc to pick "primary" (largest) cluster as base
+        group_clusters.sort(key=lambda c: -c["appeal_count"])
+        primary = dict(group_clusters[0])
+
+        combined_appeal_ids = []
+        combined_examples = []
+        combined_topic_groups: set = set()
+        sev_counts_w = defaultdict(int)
+        cat_counts_w = defaultdict(int)
+
+        for c in group_clusters:
+            combined_appeal_ids.extend(c["appeal_ids"])
+            combined_examples.extend(c.get("example_texts", []) or [])
+            combined_topic_groups.update(c.get("topic_groups", set()) or set())
+            sev = c.get("severity") or "MEDIUM"
+            if sev not in SEVERITY_ORDER:
+                sev = "MEDIUM"
+            sev_counts_w[sev] += c["appeal_count"]
+            cat_counts_w[c.get("category") or "Другое"] += c["appeal_count"]
+
+        primary["appeal_ids"] = combined_appeal_ids
+        primary["appeal_count"] = len(combined_appeal_ids)
+        # Dedup examples preserving order, keep top-5
+        seen = set()
+        deduped_examples = []
+        for ex in combined_examples:
+            if ex and ex not in seen:
+                seen.add(ex)
+                deduped_examples.append(ex)
+                if len(deduped_examples) >= 5:
+                    break
+        primary["example_texts"] = deduped_examples
+        primary["topic_groups"] = combined_topic_groups
+        primary["topic_diversity"] = len(combined_topic_groups)
+
+        # Recompute severity by weighted mode + CRITICAL escalation
+        total = sum(sev_counts_w.values()) or 1
+        critical_share = sev_counts_w.get("CRITICAL", 0) / total
+        mode_sev = max(sev_counts_w, key=lambda s: (sev_counts_w[s], -SEVERITY_ORDER.get(s, 3)))
+        primary["severity"] = "CRITICAL" if critical_share >= 0.40 else mode_sev
+
+        # Top category by weighted count
+        primary["category"] = max(cat_counts_w, key=cat_counts_w.get)
+
+        merged.append(primary)
+
+    return merged

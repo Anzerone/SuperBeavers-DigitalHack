@@ -7,7 +7,9 @@ from sqlalchemy import select, func, and_, or_
 from typing import Optional
 import openpyxl
 
+from backend.api.display_fields import DEFAULT_CATEGORY, appeal_display_category, appeal_display_severity
 from backend.labels import format_severity
+from backend.problem_naming import display_problem_name
 from backend.storage.database import get_db
 from backend.storage.models import Appeal, ProblemCluster, AppealClusterMap
 
@@ -30,8 +32,14 @@ def _multi(column, value):
 
 
 def _build_appeal_filter(run_id, municipality, severity, category, is_problem, cluster_id):
+    display_severity = appeal_display_severity()
+    display_category = appeal_display_category()
     filters = [Appeal.run_id == run_id]
-    for clause in (_multi(Appeal.municipality, municipality), _multi(Appeal.severity, severity), _multi(Appeal.category, category)):
+    for clause in (
+        _multi(Appeal.municipality, municipality),
+        _multi(display_severity, severity),
+        _multi(display_category, category),
+    ):
         if clause is not None:
             filters.append(clause)
     if is_problem is not None:
@@ -42,6 +50,19 @@ def _build_appeal_filter(run_id, municipality, severity, category, is_problem, c
                 select(AppealClusterMap.appeal_id).where(AppealClusterMap.cluster_id == cluster_id)
             )
         )
+    return filters
+
+
+def _build_cluster_filter(run_id, municipality, severity, category):
+    display_category = func.coalesce(func.nullif(ProblemCluster.category, ""), DEFAULT_CATEGORY)
+    filters = [ProblemCluster.run_id == run_id]
+    for clause in (
+        _multi(ProblemCluster.municipality, municipality),
+        _multi(ProblemCluster.severity, severity),
+        _multi(display_category, category),
+    ):
+        if clause is not None:
+            filters.append(clause)
     return filters
 
 
@@ -58,13 +79,15 @@ async def get_appeals(
     search: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
+    display_severity = appeal_display_severity().label("display_severity")
+    display_category = appeal_display_category().label("display_category")
     filters = _build_appeal_filter(run_id, municipality, severity, category, is_problem, cluster_id)
     if search:
         like = f"%{search}%"
         filters.append(or_(
             Appeal.incident_text.ilike(like),
             Appeal.municipality.ilike(like),
-            Appeal.category.ilike(like),
+            display_category.ilike(like),
         ))
 
     count_q = await db.execute(select(func.count()).where(and_(*filters)).select_from(Appeal))
@@ -72,13 +95,13 @@ async def get_appeals(
 
     offset = (page - 1) * page_size
     data_q = await db.execute(
-        select(Appeal)
+        select(Appeal, display_severity, display_category)
         .where(and_(*filters))
         .order_by(Appeal.id)
         .offset(offset)
         .limit(page_size)
     )
-    appeals = data_q.scalars().all()
+    rows = data_q.all()
 
     return {
         "total": total,
@@ -94,12 +117,12 @@ async def get_appeals(
                 "group_name": a.group_name,
                 "incident_type": a.incident_type,
                 "outcome": a.outcome,
-                "severity": a.severity,
-                "category": a.category,
+                "severity": display_severity,
+                "category": display_category,
                 "is_problem": a.is_problem,
                 "confidence": a.confidence,
             }
-            for a in appeals
+            for a, display_severity, display_category in rows
         ],
     }
 
@@ -115,26 +138,27 @@ async def get_clusters(
     search: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    filters = [ProblemCluster.run_id == run_id]
-    for clause in (_multi(ProblemCluster.municipality, municipality), _multi(ProblemCluster.severity, severity), _multi(ProblemCluster.category, category)):
-        if clause is not None:
-            filters.append(clause)
+    filters = _build_cluster_filter(run_id, municipality, severity, category)
     if search:
         like = f"%{search}%"
         filters.append(or_(
             ProblemCluster.cluster_name.ilike(like),
+            ProblemCluster.description.ilike(like),
+            ProblemCluster.centroid_text.ilike(like),
             ProblemCluster.municipality.ilike(like),
             ProblemCluster.category.ilike(like),
         ))
 
-    count_q = await db.execute(select(func.count()).where(and_(*filters)).select_from(ProblemCluster))
+    count_q = await db.execute(
+        select(func.count()).where(and_(*filters)).select_from(ProblemCluster)
+    )
     total = count_q.scalar()
 
     offset = (page - 1) * page_size
     data_q = await db.execute(
         select(ProblemCluster)
         .where(and_(*filters))
-        .order_by(ProblemCluster.appeal_count.desc())
+        .order_by(ProblemCluster.appeal_count.desc(), ProblemCluster.rank)
         .offset(offset)
         .limit(page_size)
     )
@@ -148,11 +172,19 @@ async def get_clusters(
         "items": [
             {
                 "id": c.id,
-                "cluster_name": c.cluster_name,
+                "cluster_name": display_problem_name(
+                    c.cluster_name,
+                    c.category,
+                    c.description,
+                    c.centroid_text,
+                    c.example_texts,
+                ),
                 "municipality": c.municipality,
-                "category": c.category,
-                "severity": c.severity,
+                "category": c.category or DEFAULT_CATEGORY,
+                "severity": c.severity or "MEDIUM",
+                "cluster_severity": c.severity,
                 "appeal_count": c.appeal_count,
+                "total_appeal_count": c.appeal_count,
                 "rank": c.rank,
                 "description": c.description,
                 "centroid_text": c.centroid_text,
@@ -173,24 +205,26 @@ async def export_appeals(
     cluster_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
 ):
+    display_severity = appeal_display_severity().label("display_severity")
+    display_category = appeal_display_category().label("display_category")
     filters = _build_appeal_filter(run_id, municipality, severity, category, is_problem, cluster_id)
 
     data_q = await db.execute(
-        select(Appeal).where(and_(*filters)).order_by(Appeal.id).limit(50000)
+        select(Appeal, display_severity, display_category).where(and_(*filters)).order_by(Appeal.id).limit(50000)
     )
-    appeals = data_q.scalars().all()
+    rows = data_q.all()
 
     wb = openpyxl.Workbook()
 
     ws_sum = wb.active
     ws_sum.title = "Сводка"
     ws_sum.append(["Параметр", "Значение"])
-    ws_sum.append(["Всего записей", len(appeals)])
+    ws_sum.append(["Всего записей", len(rows)])
     sev_counts = {}
     cat_counts = {}
-    for a in appeals:
-        sev_counts[a.severity] = sev_counts.get(a.severity, 0) + 1
-        cat_counts[a.category] = cat_counts.get(a.category, 0) + 1
+    for a, sev, cat in rows:
+        sev_counts[sev] = sev_counts.get(sev, 0) + 1
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
     ws_sum.append([])
     ws_sum.append(["Тяжесть", "Количество"])
     for s, c in sorted(sev_counts.items(), key=lambda x: -x[1]):
@@ -202,12 +236,12 @@ async def export_appeals(
 
     ws_data = wb.create_sheet("Обращения")
     ws_data.append(["#", "Район", "Текст обращения", "Группа тем", "Тип инцидента", "Итог", "Тяжесть", "Категория"])
-    for i, a in enumerate(appeals, 1):
+    for i, (a, sev, cat) in enumerate(rows, 1):
         ws_data.append([
             i, a.municipality,
             (a.incident_text or "")[:500],
             a.group_name, a.incident_type, a.outcome,
-            format_severity(a.severity), a.category,
+            format_severity(sev), cat,
         ])
 
     buf = io.BytesIO()

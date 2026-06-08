@@ -114,8 +114,12 @@ def _save_appeals_bulk(session, run_id: int, df, texts: list[str], predictions: 
                     "is_problem": is_problem,
                     "classification_method": predictions["method"][idx],
                     "confidence": float(predictions["confidence"][idx]),
-                    "severity": predictions["severity"][idx] if is_problem else None,
-                    "category": predictions["category"][idx] if is_problem else None,
+                    # Севериити и категория сохраняются для ВСЕХ обращений
+                    # (включая благодарности/вопросы), а не только для проблемных.
+                    # Классификатор всегда выдает предсказание; это даёт
+                    # цельную картинку и убирает «пустые ячейки» в UI.
+                    "severity": predictions["severity"][idx],
+                    "category": predictions["category"][idx],
                     "sentiment": predictions.get("sentiment", [None] * total)[idx],
                     "sentiment_score": predictions.get("sentiment_score", [None] * total)[idx],
                     "embedding": embeddings[idx].tobytes() if STORE_EMBEDDINGS_IN_DB else None,

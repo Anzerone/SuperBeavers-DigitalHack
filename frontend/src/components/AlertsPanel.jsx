@@ -72,7 +72,7 @@ export default function AlertsPanel({ runId, onSelect }) {
                     <span className="text-gray-400">·</span>
                     <span className="text-gray-500">{a.municipality}</span>
                     <span className="text-gray-300">·</span>
-                    <span className="text-gray-500">{a.category}</span>
+                    <span className="text-gray-500">{a.category || 'Другое'}</span>
                   </div>
                   <div className="text-sm text-gray-700 truncate" title={a.name}>
                     {a.name}

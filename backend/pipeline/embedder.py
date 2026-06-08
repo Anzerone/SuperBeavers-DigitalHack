@@ -2,6 +2,7 @@
 import hashlib
 import logging
 import os
+import time
 
 import numpy as np
 
@@ -113,8 +114,20 @@ def compute_embeddings(texts: list[str], batch_size: int | None = None, progress
 
     cached = _load_cached(texts)
     if cached is not None:
+        # Кеш отдаётся мгновенно — но UI ждёт «динамики» на этом шаге.
+        # Делаем серию искусственных пингов с задержкой, чтобы прогрессбар
+        # плавно дополз до конца шага, а пользователь увидел, что мы используем кеш.
         if progress_callback:
-            progress_callback(len(texts), len(texts), "Эмбеддинги взяты из кеша")
+            n_total = len(texts)
+            for fraction, label in [
+                (0.25, "Анализ писем: загрузка из кеша"),
+                (0.55, "Анализ писем: проверка совпадений в кеше"),
+                (0.85, "Анализ писем: применение кешированных векторов"),
+                (1.0, "Анализ содержания писем: готово (из кеша)"),
+            ]:
+                progress_callback(int(n_total * fraction), n_total, label)
+                # min_interval в _progress_updater = 0.3s → даём ему дойти до БД
+                time.sleep(0.4)
         return cached.astype(np.float32, copy=False)
 
     batch_size = batch_size or EMBEDDING_BATCH_SIZE

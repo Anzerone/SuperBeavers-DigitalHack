@@ -27,6 +27,13 @@ const CAT_PALETTE = [
   '#ec4899', '#f97316', '#eab308', '#84cc16', '#22c55e',
 ]
 
+const SEVERITY_RANK = {
+  CRITICAL: 0,
+  HIGH: 1,
+  MEDIUM: 2,
+  LOW: 3,
+}
+
 const TOOLTIP_LABELS = {
   count: 'Количество',
   value: 'Количество',
@@ -93,7 +100,7 @@ function TreemapCell(props) {
   )
 }
 
-export default function Charts({ data, filters, onChartClick }) {
+export default function Charts({ data, filters, onChartClick, activeTab = 'clusters' }) {
   const [catView, setCatView] = useState('list') // list | treemap
   const [distView, setDistView] = useState('bar')  // bar | treemap
 
@@ -115,7 +122,12 @@ export default function Charts({ data, filters, onChartClick }) {
   const selSeverities = selectedOf('severity')
 
   const districts = (data.districts || []).slice(0, 10)
-  const severities = data.severity || []
+  const severities = useMemo(() => {
+    const severitySource = activeTab === 'appeals' ? (data.severity_appeals || data.severity || []) : (data.severity || [])
+    return [...severitySource]
+      .filter(s => s?.severity)
+      .sort((a, b) => (SEVERITY_RANK[a.severity] ?? 99) - (SEVERITY_RANK[b.severity] ?? 99))
+  }, [activeTab, data.severity, data.severity_appeals])
   const categories = data.categories || []
   const topCategories = categories.slice(0, 6)
   const totalSev = severities.reduce((s, d) => s + d.count, 0) || 1
@@ -127,11 +139,28 @@ export default function Charts({ data, filters, onChartClick }) {
     fill: SEVERITY_COLORS[s.severity] || '#9ca3af',
     severity: s.severity,
   })), [severities])
+  const severityTitle = activeTab === 'appeals' ? 'Тяжесть обращений' : 'Тяжесть кластеров'
+  const severityUnit = activeTab === 'appeals' ? 'обращений' : 'кластеров'
 
   const severeCount = severities
     .filter(s => s.severity === 'CRITICAL' || s.severity === 'HIGH')
     .reduce((sum, s) => sum + s.count, 0)
-  const centerPct = severities.length > 0 ? Math.round(severeCount / totalSev * 100) : 0
+
+  // Центр пирога: если есть крит/высокая — показываем их суммарную долю;
+  // если их нет — доминирующую severity (чтобы не было сбивающего «0%»).
+  const dominant = useMemo(() => {
+    if (!severities.length) return null
+    const top = [...severities].sort((a, b) => b.count - a.count)[0]
+    return top
+  }, [severities])
+
+  const hasSevere = severeCount > 0
+  const centerPct = hasSevere
+    ? Math.round((severeCount / totalSev) * 100)
+    : (dominant ? Math.round((dominant.count / totalSev) * 100) : 0)
+  const centerLabel = hasSevere
+    ? 'крит. + высок.'
+    : (dominant ? formatSeverity(dominant.severity, { short: true }).toLowerCase() : 'нет данных')
 
   const catTreemap = useMemo(() => topCategories.map((c, i) => ({
     name: c.category,
@@ -232,7 +261,7 @@ export default function Charts({ data, filters, onChartClick }) {
 
       {/* Severity donut */}
       <div className="bg-white rounded-xl p-4 shadow-sm">
-        <h3 className="text-sm font-semibold text-gray-700 mb-3">Тяжесть{selSeverities.length > 0 ? ` · выбрано: ${selSeverities.length}` : ''}</h3>
+        <h3 className="text-sm font-semibold text-gray-700 mb-3">{severityTitle}{selSeverities.length > 0 ? ` · выбрано: ${selSeverities.length}` : ''}</h3>
         <div className="relative">
           <ResponsiveContainer width="100%" height={180}>
             <PieChart>
@@ -261,10 +290,10 @@ export default function Charts({ data, filters, onChartClick }) {
           <div
             className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none"
             style={{ top: -10 }}
-            title={`${severeCount} критических и высоких обращений`}
+            title={`${severeCount} критических и высоких ${severityUnit}`}
           >
             <span className="text-xl font-bold leading-tight text-gray-700">{centerPct}%</span>
-            <span className="text-[10px] leading-tight text-gray-400">крит. + высок.</span>
+            <span className="text-[10px] leading-tight text-gray-400">{centerLabel}</span>
           </div>
         </div>
         <div className="flex flex-wrap gap-x-3 gap-y-1 justify-center mt-1">

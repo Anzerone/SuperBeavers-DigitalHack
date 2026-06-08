@@ -30,6 +30,9 @@ export default function DashboardPage({ runId, setRunId }) {
   const [filters, setFilters] = useState({})
   const [filterCount, setFilterCount] = useState(0)
   const [dataRefreshKey, setDataRefreshKey] = useState(0)
+  // Активная вкладка таблиц («clusters» или «appeals») — поднята из DataTabs
+  // чтобы donut «Тяжесть» строился по соответствующему срезу данных.
+  const [activeTab, setActiveTab] = useState('clusters')
 
   // Полный (неотфильтрованный) список вариантов для выпадающих фильтров —
   // чтобы выбор одного значения не убирал остальные из списка.
@@ -51,25 +54,27 @@ export default function DashboardPage({ runId, setRunId }) {
   const loadData = useCallback(async () => {
     if (!runId) return
     try {
+      const chartScope = activeTab === 'appeals' ? 'appeals' : 'clusters'
       // Кросс-фильтрация: каждый график фильтруем по ДРУГИМ измерениям, но не
       // по своему собственному — так все его значения остаются видимыми и
       // кликабельными (можно выбрать несколько прямо на графике).
       const [s, dDist, dCat, dSev] = await Promise.all([
         getStats(runId),
-        getChartData(runId, stripKey(filters, 'municipality')),
-        getChartData(runId, stripKey(filters, 'category')),
-        getChartData(runId, stripKey(filters, 'severity')),
+        getChartData(runId, stripKey(filters, 'municipality'), chartScope),
+        getChartData(runId, stripKey(filters, 'category'), chartScope),
+        getChartData(runId, stripKey(filters, 'severity'), chartScope),
       ])
       setStats(s)
       setChartData({
         districts: dDist.districts || [],
         categories: dCat.categories || [],
         severity: dSev.severity || [],
+        severity_appeals: dSev.severity_appeals || [],
       })
     } catch (e) {
       console.error('Failed to load data:', e)
     }
-  }, [runId, filters])
+  }, [runId, filters, activeTab])
 
   useEffect(() => { loadData() }, [loadData])
 
@@ -203,15 +208,15 @@ export default function DashboardPage({ runId, setRunId }) {
 
         {/* Charts */}
         {chartData && (
-          <Charts data={chartData} filters={filters} onChartClick={handleChartClick} />
+          <Charts data={chartData} filters={filters} onChartClick={handleChartClick} activeTab={activeTab} />
         )}
 
         {/* Timeline */}
-        {runId && <Timeline runId={runId} filters={filters} refreshKey={dataRefreshKey} />}
+        {runId && <Timeline runId={runId} filters={filters} refreshKey={dataRefreshKey} activeTab={activeTab} />}
 
         {/* Tables */}
         {runId && (
-          <DataTabs runId={runId} filters={filters} refreshKey={dataRefreshKey} onExport={() => exportAppeals(runId, filters)} />
+          <DataTabs runId={runId} filters={filters} refreshKey={dataRefreshKey} onExport={() => exportAppeals(runId, filters)} activeTab={activeTab} onTabChange={setActiveTab} />
         )}
       </div>
     </div>

@@ -93,14 +93,14 @@ export async function getTopDistricts(runId, n = 10) {
   return data
 }
 
-export async function getChartData(runId, filters = {}) {
-  const params = new URLSearchParams(flattenFilters(filters))
+export async function getChartData(runId, filters = {}, scope = 'clusters') {
+  const params = new URLSearchParams({ ...flattenFilters(filters), scope })
   const { data } = await api.get(`/dashboard/charts/${runId}?${params}`)
   return data
 }
 
-export async function getTimeline(runId, filters = {}, granularity = 'week') {
-  const params = new URLSearchParams({ granularity, ...flattenFilters(filters) })
+export async function getTimeline(runId, filters = {}, granularity = 'week', scope = 'appeals') {
+  const params = new URLSearchParams({ granularity, scope, ...flattenFilters(filters) })
   const { data } = await api.get(`/dashboard/timeline/${runId}?${params}`)
   return data
 }
@@ -178,6 +178,11 @@ export async function annotateAppeal(payload) {
 
 export async function sendChatMessage(runId, message) {
   const { data } = await api.post(`/chat?run_id=${runId}&message=${encodeURIComponent(message)}`)
+  return data
+}
+
+export async function resetChat(runId) {
+  const { data } = await api.post(`/chat/reset?run_id=${runId}`)
   return data
 }
 

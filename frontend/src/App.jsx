@@ -6,6 +6,7 @@ import InfoPage from './pages/InfoPage.jsx'
 import LearningPage from './pages/LearningPage.jsx'
 import LoginPage from './pages/LoginPage.jsx'
 import GovIcon from './components/GovIcon.jsx'
+import omskOblastCoatOfArms from './assets/omsk-oblast-coat-of-arms.png'
 import { getAuthToken, getCurrentUser, getLatestRun, login, logout } from './api.js'
 
 export default function App() {
@@ -98,8 +99,8 @@ export default function App() {
       <div className="min-h-screen bg-[#e8f0f2]">
         <header className="flex items-center justify-between bg-[#0d7377] px-6 py-3 text-white shadow-md">
           <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/20">
-              <GovIcon name="app" className="h-5 w-5" />
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white p-1 shadow-sm">
+              <img src={omskOblastCoatOfArms} alt="Герб Омской области" className="h-full w-full object-contain" />
             </div>
             <div>
               <h1 className="text-lg font-semibold leading-tight">Классификатор обращений</h1>
