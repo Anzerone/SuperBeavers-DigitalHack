@@ -59,6 +59,14 @@ def set_cached_llm(namespace: str, key: Any, value: Any) -> None:
             pass
 
 
+def ollama_response_text(payload: dict) -> str:
+    """Return useful text from Ollama, including qwen3 thinking-only replies."""
+    response = str(payload.get("response") or "").strip()
+    if response:
+        return response
+    return str(payload.get("thinking") or "").strip()
+
+
 def parse_llm_json(response_text: str) -> Any:
     """Parse JSON from Ollama, tolerating markdown fences and common JSON slips."""
     if not response_text:

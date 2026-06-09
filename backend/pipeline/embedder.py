@@ -56,11 +56,29 @@ def _cache_key(texts: list[str]) -> str:
 
     Включает LoRA-путь, чтобы базовые и fine-tuned эмбеддинги не смешивались.
     """
-    from backend.config import EMBEDDING_LORA_PATH, EMBEDDING_MODEL_NAME
+    from backend.config import (
+        EMBEDDING_BACKEND,
+        EMBEDDING_LORA_PATH,
+        EMBEDDING_MODEL_NAME,
+        EMBEDDING_ONNX_DIR,
+        EMBEDDING_POOLING,
+    )
 
     hasher = hashlib.sha256()
-    hasher.update(EMBEDDING_MODEL_NAME.encode("utf-8"))
-    if EMBEDDING_LORA_PATH:
+    hasher.update(f"backend={EMBEDDING_BACKEND}|model={EMBEDDING_MODEL_NAME}".encode("utf-8"))
+    if EMBEDDING_BACKEND == "onnx":
+        hasher.update(f"|pooling={EMBEDDING_POOLING}".encode("utf-8"))
+        onnx_dir = EMBEDDING_ONNX_DIR
+        if not os.path.isabs(onnx_dir):
+            onnx_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), onnx_dir)
+        hasher.update(f"|onnx_dir={os.path.normpath(onnx_dir)}".encode("utf-8"))
+        for model_name in ("model_quantized.onnx", "model.onnx"):
+            model_file = os.path.join(onnx_dir, model_name)
+            if os.path.exists(model_file):
+                stat = os.stat(model_file)
+                hasher.update(f"|onnx_file={model_name}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8"))
+                break
+    elif EMBEDDING_LORA_PATH:
         hasher.update(f"|lora={EMBEDDING_LORA_PATH}".encode("utf-8"))
         model_file = os.path.join(EMBEDDING_LORA_PATH, "model.safetensors")
         if os.path.exists(model_file):
@@ -105,12 +123,34 @@ def _save_cached(texts: list[str], embeddings: np.ndarray) -> None:
 
 
 def compute_embeddings(texts: list[str], batch_size: int | None = None, progress_callback=None) -> np.ndarray:
-    """Compute embeddings for all texts using GPU batching.
+    """Compute embeddings for all texts.
+
+    Backend is chosen by `EMBEDDING_BACKEND`:
+      - "sentence_transformers" (default) — PyTorch on GPU
+      - "onnx" — ONNX INT8 on CPU (use for Astra Linux deployment)
 
     Returns numpy array of shape (N, 1024).
     """
     if not texts:
         return np.empty((0, 0), dtype=np.float32)
+
+    # ONNX backend: faster CPU inference via INT8 quantized bge-m3.
+    from backend.config import EMBEDDING_BACKEND
+    if EMBEDDING_BACKEND == "onnx":
+        cached = _load_cached(texts)
+        if cached is not None:
+            if progress_callback:
+                progress_callback(len(texts), len(texts), "Анализ содержания писем: готово (из кеша)")
+            return cached.astype(np.float32, copy=False)
+
+        from backend.pipeline.embedder_onnx import compute_embeddings_onnx
+        result = compute_embeddings_onnx(
+            texts,
+            batch_size=batch_size or 32,
+            progress_callback=progress_callback,
+        )
+        _save_cached(texts, result)
+        return result
 
     cached = _load_cached(texts)
     if cached is not None:

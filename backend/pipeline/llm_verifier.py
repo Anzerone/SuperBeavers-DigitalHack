@@ -16,7 +16,7 @@ from backend.config import (
     OLLAMA_URL,
     SEVERITIES,
 )
-from backend.pipeline.llm_utils import get_cached_llm, parse_llm_json, set_cached_llm
+from backend.pipeline.llm_utils import get_cached_llm, ollama_response_text, parse_llm_json, set_cached_llm
 
 logger = logging.getLogger(__name__)
 
@@ -79,13 +79,14 @@ JSON:"""
                 "prompt": prompt,
                 "system": system,
                 "stream": False,
+                "think": False,
                 "options": {"temperature": 0.1, "num_predict": 900},
                 "format": "json",
             },
             timeout=LLM_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
-        data = parse_llm_json(resp.json().get("response", ""))
+        data = parse_llm_json(ollama_response_text(resp.json()))
 
         if isinstance(data, list):
             results = data

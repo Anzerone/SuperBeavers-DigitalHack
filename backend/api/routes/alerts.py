@@ -38,7 +38,13 @@ async def get_alerts(run_id: int, db: AsyncSession = Depends(get_db)):
     # Предыдущий completed run
     prev_q = await db.execute(
         select(ProcessingRun)
-        .where(and_(ProcessingRun.id < run_id, ProcessingRun.status == "completed"))
+        .where(
+            and_(
+                ProcessingRun.user_id == cur.user_id,
+                ProcessingRun.id < run_id,
+                ProcessingRun.status == "completed",
+            )
+        )
         .order_by(ProcessingRun.id.desc())
         .limit(1)
     )

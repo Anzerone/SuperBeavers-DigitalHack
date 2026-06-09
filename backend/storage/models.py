@@ -39,6 +39,21 @@ class FilterPreset(Base):
     )
 
 
+class ChatMemory(Base):
+    __tablename__ = "chat_memory"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(Integer, ForeignKey("processing_runs.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    context = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_chat_memory_run_user", "run_id", "user_id", unique=True),
+    )
+
+
 class ProcessingRun(Base):
     __tablename__ = "processing_runs"
 

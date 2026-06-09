@@ -46,6 +46,9 @@ DEFAULT_USER_PASSWORD = os.getenv("DEFAULT_USER_PASSWORD", "user123")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:8b")
 LLM_FALLBACK_MODEL = "qwen2.5:7b"
+CHAT_LLM_MODEL = os.getenv("CHAT_LLM_MODEL", "qwen3:4b")
+CHAT_INTENT_MODEL = os.getenv("CHAT_INTENT_MODEL", "qwen3:4b")
+CHAT_LLM_TIMEOUT_SECONDS = _int_env("CHAT_LLM_TIMEOUT_SECONDS", 30)
 
 # Embedding
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
@@ -57,6 +60,14 @@ EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cuda")
 EMBEDDING_MAX_SEQ_LENGTH = _int_env("EMBEDDING_MAX_SEQ_LENGTH", 320)
 # Use fp16 on GPU for a large speedup with negligible quality loss.
 EMBEDDING_USE_FP16 = _bool_env("EMBEDDING_USE_FP16", True)
+
+# Embedding backend: "sentence_transformers" (PyTorch, default) or "onnx" (ONNX INT8 on CPU).
+# Switch to "onnx" for fast CPU deployment (Astra Linux server). On RTX 5090 GPU keep "sentence_transformers".
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "sentence_transformers").strip().lower()
+EMBEDDING_ONNX_DIR = os.getenv("EMBEDDING_ONNX_DIR", "models/bge-m3-onnx-int8")
+# 0 = use all CPU cores
+EMBEDDING_ONNX_THREADS = _int_env("EMBEDDING_ONNX_THREADS", 0) or None
+EMBEDDING_POOLING = os.getenv("EMBEDDING_POOLING", "cls").strip().lower()
 
 # LoRA adapter path: если задан, загружается поверх базовой bge-m3 модели.
 # Адаптер обучается через `python -m backend.scripts.finetune_bge`.
@@ -95,10 +106,14 @@ EXCLUDE_OUTCOMES = ["Закрыто", "Разъяснено", "Решено", "�
 NON_PROBLEM_INCIDENT_TYPES = ["Информационный"]
 
 # Classification
-BOOTSTRAP_SAMPLE_SIZE = _int_env("BOOTSTRAP_SAMPLE_SIZE", 500)
+# Rule-based bootstrap — выводит метки из колонок Excel (Группа тем как
+# категория, ключевые слова текста для severity). Не требует LLM, мгновенно.
+# На CPU-режиме это критично: LLM-bootstrap на CPU занимает 15-20 минут.
+BOOTSTRAP_MODE = os.getenv("BOOTSTRAP_MODE", "llm").strip().lower()  # "llm" | "rules"
+BOOTSTRAP_SAMPLE_SIZE = _int_env("BOOTSTRAP_SAMPLE_SIZE", 300)
 LOW_CONFIDENCE_THRESHOLD = _float_env("LOW_CONFIDENCE_THRESHOLD", 0.55)
 LLM_BATCH_SIZE = _int_env("LLM_BATCH_SIZE", 30)
-LLM_CONCURRENCY = _int_env("LLM_CONCURRENCY", 4)
+LLM_CONCURRENCY = _int_env("LLM_CONCURRENCY", 6)
 LLM_TIMEOUT_SECONDS = _int_env("LLM_TIMEOUT_SECONDS", 240)
 LLM_VERIFY_BATCH_SIZE = _int_env("LLM_VERIFY_BATCH_SIZE", 15)
 LLM_VERIFY_MAX_RECORDS = _int_env("LLM_VERIFY_MAX_RECORDS", 20)
@@ -126,7 +141,7 @@ CLUSTER_MERGE_DISTANCE = _float_env("CLUSTER_MERGE_DISTANCE", 0.12)
 # LLM naming / report generation limits. Fast defaults for 400k rows.
 CLUSTER_NAME_TOP_PER_MUNICIPALITY = _int_env("CLUSTER_NAME_TOP_PER_MUNICIPALITY", 30)
 CLUSTER_NAME_MAX_TOTAL = _int_env("CLUSTER_NAME_MAX_TOTAL", 300)
-CLUSTER_NAME_CONCURRENCY = _int_env("CLUSTER_NAME_CONCURRENCY", LLM_CONCURRENCY)
+CLUSTER_NAME_CONCURRENCY = _int_env("CLUSTER_NAME_CONCURRENCY", 8)
 SUMMARY_TOP_N = _int_env("SUMMARY_TOP_N", 0)
 
 # Persistence. Embeddings are needed for clustering during the run, not for reports/chat.

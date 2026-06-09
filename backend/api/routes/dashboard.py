@@ -136,6 +136,36 @@ async def get_stats(run_id: int, db: AsyncSession = Depends(get_db)):
         else None
     )
 
+    prev_q = await db.execute(
+        select(ProcessingRun)
+        .where(
+            and_(
+                ProcessingRun.user_id == run.user_id,
+                ProcessingRun.id < run_id,
+                ProcessingRun.status == "completed",
+            )
+        )
+        .order_by(ProcessingRun.id.desc())
+        .limit(1)
+    )
+    previous_run = prev_q.scalar_one_or_none()
+    previous_problem_count = previous_run.problem_count if previous_run else None
+    current_problem_count = run.problem_count or 0
+    problem_delta = None
+    problem_delta_percent = None
+    problem_growth_direction = "none"
+    if previous_problem_count is not None:
+        previous_problem_count = previous_problem_count or 0
+        problem_delta = current_problem_count - previous_problem_count
+        if previous_problem_count > 0:
+            problem_delta_percent = round(problem_delta / previous_problem_count * 100, 1)
+        if problem_delta > 0:
+            problem_growth_direction = "up"
+        elif problem_delta < 0:
+            problem_growth_direction = "down"
+        else:
+            problem_growth_direction = "flat"
+
     return {
         "raw_records": raw,
         "total_records": filtered,
@@ -159,6 +189,14 @@ async def get_stats(run_id: int, db: AsyncSession = Depends(get_db)):
         "avg_cluster_size": avg_cluster_size,
         "largest_cluster": largest_cluster,
         "sentiment_breakdown": sentiment_breakdown,
+        "problem_growth": {
+            "has_previous": previous_run is not None,
+            "previous_run_id": previous_run.id if previous_run else None,
+            "previous_problem_count": previous_problem_count,
+            "delta": problem_delta,
+            "delta_percent": problem_delta_percent,
+            "direction": problem_growth_direction,
+        },
     }
 
 

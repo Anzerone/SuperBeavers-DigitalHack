@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import LLM_CONCURRENCY, LLM_MODEL, LLM_TIMEOUT_SECONDS, OLLAMA_URL, SUMMARY_TOP_N
 from backend.labels import format_severity
-from backend.pipeline.llm_utils import get_cached_llm, parse_llm_json, set_cached_llm
+from backend.pipeline.llm_utils import get_cached_llm, ollama_response_text, parse_llm_json, set_cached_llm
 from backend.storage.models import ProblemCluster
 
 logger = logging.getLogger(__name__)
@@ -111,12 +111,13 @@ def _generate_summary(summary: dict) -> str:
                 "prompt": prompt,
                 "system": "Ты - аналитик для руководства региона. Пиши кратко, по делу, официальным языком.",
                 "stream": False,
+                "think": False,
                 "options": {"temperature": 0.3, "num_predict": 320},
             },
             timeout=LLM_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
-        response_text = resp.json().get("response", "").strip()
+        response_text = ollama_response_text(resp.json())
         try:
             parsed = parse_llm_json(response_text)
             if isinstance(parsed, dict):

@@ -181,6 +181,11 @@ export async function sendChatMessage(runId, message) {
   return data
 }
 
+export async function getChatHistory(runId) {
+  const { data } = await api.get(`/chat/history?run_id=${runId}`)
+  return data
+}
+
 export async function resetChat(runId) {
   const { data } = await api.post(`/chat/reset?run_id=${runId}`)
   return data

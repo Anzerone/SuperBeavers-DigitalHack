@@ -91,11 +91,51 @@ function SentimentBar({ breakdown }) {
   )
 }
 
+function formatSignedNumber(value) {
+  if (value == null) return '—'
+  const abs = Math.abs(value).toLocaleString('ru')
+  if (value > 0) return `+${abs}`
+  if (value < 0) return `-${abs}`
+  return '0'
+}
+
+function formatGrowthHint(growth) {
+  if (!growth?.has_previous) return 'Нет предыдущей обработки'
+  const previous = (growth.previous_problem_count ?? 0).toLocaleString('ru')
+  if (growth.delta_percent == null) return `Было ${previous}`
+  const pct = Math.abs(growth.delta_percent).toLocaleString('ru', { maximumFractionDigits: 1 })
+  if (growth.direction === 'up') return `+${pct}% к прошлой обработке`
+  if (growth.direction === 'down') return `-${pct}% к прошлой обработке`
+  return `Без изменений, было ${previous}`
+}
+
 export default function MetricCards({ stats }) {
   const sentimentBreakdown = stats.sentiment_breakdown || {}
   const angryCount = (sentimentBreakdown.ANGRY || 0) + (sentimentBreakdown.DESPERATE || 0)
   const totalSent = Object.values(sentimentBreakdown).reduce((s, v) => s + v, 0)
   const angryPct = totalSent > 0 ? Math.round(angryCount / totalSent * 100) : 0
+  const problemGrowth = stats.problem_growth || {}
+  const hasProblemGrowth = Boolean(problemGrowth.has_previous)
+  const growthDirection = problemGrowth.direction || 'none'
+  const growthColor = growthDirection === 'up'
+    ? 'text-red-600'
+    : growthDirection === 'down'
+      ? 'text-emerald-600'
+      : 'text-gray-800'
+  const growthAccent = !hasProblemGrowth
+    ? 'border-gray-200'
+    : growthDirection === 'up'
+      ? 'border-red-300'
+      : growthDirection === 'down'
+        ? 'border-emerald-300'
+        : 'border-gray-300'
+  const growthIconBg = !hasProblemGrowth
+    ? 'bg-gray-100'
+    : growthDirection === 'up'
+      ? 'bg-red-50'
+      : growthDirection === 'down'
+        ? 'bg-emerald-50'
+        : 'bg-gray-100'
 
   const cards = useMemo(() => [
     {
@@ -115,6 +155,16 @@ export default function MetricCards({ stats }) {
       icon: 'warning',
       iconBg: 'bg-orange-50',
       footer: <MiniBar breakdown={stats.severity_breakdown} />,
+    },
+    {
+      key: 'problem-growth',
+      label: 'Прирост проблем',
+      value: hasProblemGrowth ? formatSignedNumber(problemGrowth.delta || 0) : '—',
+      hint: formatGrowthHint(problemGrowth),
+      accent: growthAccent,
+      icon: 'trend',
+      iconBg: growthIconBg,
+      valueClass: growthColor,
     },
     {
       key: 'severe',
@@ -173,7 +223,7 @@ export default function MetricCards({ stats }) {
       valueClass: angryPct > 30 ? 'text-purple-700' : 'text-gray-800',
       footer: <SentimentBar breakdown={sentimentBreakdown} />,
     },
-  ], [stats, sentimentBreakdown, angryCount, totalSent, angryPct])
+  ], [stats, sentimentBreakdown, angryCount, totalSent, angryPct, hasProblemGrowth, problemGrowth, growthAccent, growthIconBg, growthColor])
 
   return (
     <div className="grid grid-cols-2 md:grid-cols-3 gap-3">

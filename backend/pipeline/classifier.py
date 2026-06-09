@@ -12,9 +12,13 @@ from sklearn.preprocessing import LabelEncoder
 from backend.config import (
     CATEGORIES,
     CLASSIFIER_CACHE_DIR,
+    EMBEDDING_BACKEND,
     EMBEDDING_LORA_PATH,
     EMBEDDING_MAX_SEQ_LENGTH,
     EMBEDDING_MODEL_NAME,
+    EMBEDDING_ONNX_DIR,
+    EMBEDDING_POOLING,
+    PROJECT_ROOT,
     SEVERITIES,
 )
 
@@ -37,11 +41,21 @@ def _cache_signature(categories: list[str] | None = None) -> str:
     cats = [str(category) for category in (categories or CATEGORIES)]
     parts = [
         f"pipeline={CACHE_FEATURE_PIPELINE}",
+        f"embedding_backend={EMBEDDING_BACKEND}",
         f"embedding_model={EMBEDDING_MODEL_NAME}",
         f"max_seq_length={EMBEDDING_MAX_SEQ_LENGTH}",
         "categories=" + "\n".join(cats),
     ]
-    if EMBEDDING_LORA_PATH:
+    if EMBEDDING_BACKEND == "onnx":
+        onnx_dir = EMBEDDING_ONNX_DIR
+        if not os.path.isabs(onnx_dir):
+            onnx_dir = str(PROJECT_ROOT / onnx_dir)
+        onnx_dir = os.path.normpath(onnx_dir)
+        parts.append(f"onnx_dir={onnx_dir}")
+        parts.append(f"onnx_pooling={EMBEDDING_POOLING}")
+        parts.append("onnx_model=" + _file_fingerprint(os.path.join(onnx_dir, "model_quantized.onnx")))
+        parts.append("lora_path=ignored_for_onnx")
+    elif EMBEDDING_LORA_PATH:
         lora_path = os.path.normpath(EMBEDDING_LORA_PATH)
         parts.append(f"lora_path={lora_path}")
         parts.append(

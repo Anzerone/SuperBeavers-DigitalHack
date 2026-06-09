@@ -1,31 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { exportChatResult, resetChat, sendChatMessage } from '../api.js'
+import { exportChatResult, getChatHistory, resetChat, sendChatMessage } from '../api.js'
 import GovIcon from '../components/GovIcon.jsx'
-
-function renderWithCitations(text, citations) {
-  if (!text) return text
-  const parts = []
-  let lastIdx = 0
-  const re = /\[(\d+)\]/g
-  let m
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > lastIdx) parts.push(text.slice(lastIdx, m.index))
-    const n = parseInt(m[1], 10)
-    const citation = citations[n - 1]
-    parts.push(
-      <span
-        key={`${m.index}`}
-        title={citation ? `${citation.municipality} · ${citation.category}: ${citation.text.slice(0, 200)}` : ''}
-        className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 mx-0.5 text-[10px] font-semibold bg-teal-100 text-teal-700 rounded cursor-help align-middle"
-      >
-        {n}
-      </span>
-    )
-    lastIdx = m.index + m[0].length
-  }
-  if (lastIdx < text.length) parts.push(text.slice(lastIdx))
-  return parts
-}
 
 const QUICK_ACTIONS = [
   'Топ-10 районов',
@@ -49,6 +24,9 @@ const COLUMN_LABELS = {
   top_issues: 'Ключевые проблемы',
   summary_text: 'Сводка',
   cluster_name: 'Проблема',
+  description: 'Описание',
+  explanation: 'Пояснение',
+  example: 'Пример обращения',
   category: 'Категория',
   severity: 'Тяжесть',
   centroid_text: 'Выдержка',
@@ -56,7 +34,10 @@ const COLUMN_LABELS = {
   count: 'Количество',
   severe_count: 'Критичных и высоких',
   muni_count: 'Муниципалитетов',
+  municipality_count: 'Муниципалитетов',
   category_count: 'Категорий',
+  share_percent: 'Доля, %',
+  severe_share_percent: 'Доля тяжелых, %',
   group_name: 'Группа тем',
   incident_type: 'Тип инцидента',
   outcome: 'Итог',
@@ -97,6 +78,45 @@ export default function ChatPage({ runId }) {
       : []
 
   useEffect(() => {
+    if (!runId) {
+      setMessages([])
+      setCtxInfo(null)
+      return
+    }
+    let cancelled = false
+    getChatHistory(runId)
+      .then((data) => {
+        if (cancelled) return
+        setCtxInfo(data.context || null)
+        const restored = (data.history || []).flatMap((item) => [
+          { role: 'user', text: item.question },
+          {
+            role: 'assistant',
+            text: item.answer,
+            fallback: item.fallback,
+            narration: item.narration,
+            sql: item.sql,
+            data: item.data,
+            columns: item.columns,
+            suggestions: item.suggestions || [],
+            fast: item.fast,
+            kind: item.kind,
+          },
+        ])
+        setMessages(restored)
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMessages([])
+          setCtxInfo(null)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [runId])
+
+  useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
@@ -127,7 +147,6 @@ export default function ChatPage({ runId }) {
           text: data.answer,
           fallback: data.fallback,
           narration: data.narration,
-          citations: data.citations || [],
           sql: data.sql,
           data: data.data,
           columns: data.columns,
@@ -156,6 +175,18 @@ export default function ChatPage({ runId }) {
 
   return (
     <div className="mx-auto flex h-[calc(100vh-60px)] max-w-4xl flex-col p-4">
+      {messages.length > 0 && (
+        <div className="mb-3 flex justify-end">
+          <button
+            onClick={clearChat}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-500 shadow-sm transition hover:border-gray-300 hover:text-gray-800"
+          >
+            <GovIcon name="trash" className="h-3.5 w-3.5" />
+            Очистить
+          </button>
+        </div>
+      )}
+
       {/* Context bar */}
       {ctxInfo && (ctxInfo.last_municipality || contextCategories.length > 0) && (
         <div className="mb-3 flex items-center gap-2 text-xs text-gray-500">
@@ -172,9 +203,6 @@ export default function ChatPage({ runId }) {
               {category}
             </span>
           ))}
-          <button onClick={clearChat} className="ml-auto text-gray-400 hover:text-gray-700 underline">
-            Очистить
-          </button>
         </div>
       )}
 
@@ -204,27 +232,10 @@ export default function ChatPage({ runId }) {
                 message.role === 'user' ? 'bg-[#0d7377] text-white' : 'bg-white shadow-sm'
               }`}
             >
-              {/* Narration (LLM) or fallback text with citation links */}
+              {/* Assistant answer */}
               <p className="whitespace-pre-wrap text-sm leading-relaxed">
-                {message.citations?.length ? renderWithCitations(message.text, message.citations) : message.text}
+                {message.text}
               </p>
-
-              {/* Citations list */}
-              {message.citations?.length > 0 && (
-                <div className="mt-3 pt-2 border-t border-gray-100 space-y-1">
-                  <p className="text-[11px] text-gray-400">Источники:</p>
-                  {message.citations.map((c, i) => (
-                    <details key={i} className="text-xs">
-                      <summary className="cursor-pointer text-teal-700 hover:text-teal-900">
-                        [{i + 1}] {c.municipality} · {c.category}
-                      </summary>
-                      <p className="mt-1 pl-3 text-gray-600 italic border-l-2 border-teal-100">
-                        {c.text}
-                      </p>
-                    </details>
-                  ))}
-                </div>
-              )}
 
               {/* Data table */}
               {message.data && message.data.length > 0 && (

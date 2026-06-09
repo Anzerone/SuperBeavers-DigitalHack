@@ -8,13 +8,19 @@
 2. Скачайте модель для локального LLM:
 
 ```bash
-ollama pull qwen3:8b
+ollama pull qwen3:4b
 ```
 
 3. Установите зависимости backend:
 
 ```bash
 pip install -r backend/requirements.txt
+```
+
+Для CPU-режима с ONNX INT8 подготовьте модель эмбеддингов:
+
+```bash
+python scripts/convert_to_onnx_int8.py
 ```
 
 4. Установите зависимости frontend:
@@ -29,6 +35,12 @@ cd ..
 
 ```bash
 start.bat
+```
+
+Для запуска CPU-конфигурации `ONNX INT8 + qwen3:4b` используйте:
+
+```bash
+start_cpu.bat
 ```
 
 После запуска backend будет доступен по адресу `http://localhost:8001`, frontend — по адресу `http://localhost:5173`.

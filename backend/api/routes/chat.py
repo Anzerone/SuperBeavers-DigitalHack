@@ -1,31 +1,71 @@
-"""Fast chat endpoint: deterministic analytics + LLM narration + memory."""
+"""Model-driven analytical chat endpoint with persisted memory."""
 import io
 import json
-import re
+from decimal import Decimal
 from typing import Any
 
 import aiohttp
 import openpyxl
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, select, text
+from sqlalchemy import and_, func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.config import CATEGORIES, LLM_MODEL, LLM_TIMEOUT_SECONDS, OLLAMA_URL
-from backend.api.display_fields import appeal_display_category, appeal_display_severity, category_value, severity_value
 from backend.api.deps import get_current_user
-from backend.labels import format_severity
+from backend.config import (
+    CHAT_INTENT_MODEL,
+    CHAT_LLM_MODEL,
+    CHAT_LLM_TIMEOUT_SECONDS,
+    OLLAMA_URL,
+)
+from backend.pipeline.llm_utils import ollama_response_text
 from backend.storage.database import get_db
-from backend.storage.models import Appeal, User
+from backend.storage.models import ChatMemory, User
 
 router = APIRouter()
 
-# Per-user, per-run conversation memory: history + sticky context (last muni/category)
 _conversations: dict[tuple[int, int], dict] = {}
 
 
+CHAT_COLUMN_LABELS = {
+    "municipality": "Район",
+    "problem_count": "Проблемных обращений",
+    "appeal_count": "Обращений",
+    "rank": "Ранг",
+    "avg_rank": "Средний ранг",
+    "top_issues": "Ключевые проблемы",
+    "summary_text": "Сводка",
+    "cluster_name": "Проблема",
+    "description": "Описание",
+    "explanation": "Пояснение",
+    "example": "Пример обращения",
+    "category": "Категория",
+    "severity": "Тяжесть",
+    "centroid_text": "Выдержка",
+    "cluster_count": "Кластеров",
+    "count": "Количество",
+    "severe_count": "Критичных и высоких",
+    "municipality_count": "Муниципалитетов",
+    "category_count": "Категорий",
+    "share_percent": "Доля, %",
+    "severe_share_percent": "Доля тяжелых, %",
+    "group_name": "Группа тем",
+    "incident_type": "Тип инцидента",
+    "outcome": "Итог",
+    "incident_text": "Текст обращения",
+    "confidence": "Уверенность",
+}
+
+SEVERITY_LABELS = {
+    "CRITICAL": "Критическая",
+    "HIGH": "Высокая",
+    "MEDIUM": "Средняя",
+    "LOW": "Низкая",
+}
+
+
 def _ctx(run_id: int, user_id: int = 0) -> dict:
-    """Get-or-create conversation context for a run."""
     key = (run_id, user_id)
     if key not in _conversations:
         _conversations[key] = {
@@ -39,111 +79,86 @@ def _ctx(run_id: int, user_id: int = 0) -> dict:
     return _conversations[key]
 
 
-SYSTEM_PROMPT = """Ты - аналитик обращений граждан Омской области. У тебя есть БД PostgreSQL.
+def _context_response(ctx: dict) -> dict:
+    return {
+        "last_municipality": ctx.get("last_municipality"),
+        "last_municipalities": ctx.get("last_municipalities", []),
+        "last_category": ctx.get("last_category"),
+        "last_categories": ctx.get("last_categories", []),
+        "last_severity": ctx.get("last_severity"),
+    }
 
-Таблицы:
-- problem_clusters: id, run_id, municipality, cluster_name, description, category, severity, appeal_count, rank, rank_score, topic_diversity, centroid_text
-- summaries: id, run_id, municipality, rank, problem_count, avg_rank, top_issues (jsonb), summary_text, centroid_excerpt
-- appeals: id, run_id, municipality, group_name, incident_type, outcome, incident_text, is_problem, severity, category, confidence
 
-Текущий run_id = {run_id}.
+def _memory_payload(ctx: dict) -> dict:
+    return {
+        "history": ctx.get("history", [])[-10:],
+        **_context_response(ctx),
+    }
 
-Правила:
-1. Сгенерируй ровно один SELECT-запрос. Без markdown, без точки с запятой.
-2. Всегда фильтруй по run_id = {run_id}.
-3. Для рейтинга/топа районов — таблица summaries, сортировка по rank ASC.
-4. Для конкретного района — problem_clusters с municipality = ... и сортировкой по rank.
-5. Для общего числа обращений по категории — appeals с is_problem = true.
-6. Добавляй LIMIT 50 или меньше.
-7. Категория = одно из значений колонки "Группа тем" датасета (например 'ЖКХ', 'Дороги', 'Здравоохранение')."""
 
-NARRATE_SYSTEM = """Ты — аналитик обращений граждан. Из таблицы данных и вопроса пользователя составь короткий, естественный, дружелюбный ответ на русском.
-Правила:
-- 2–4 предложения максимум.
-- Назови ключевые цифры словами (не списком). Округляй большие числа.
-- Если данных мало или они шумные — честно скажи об этом.
-- Не повторяй вопрос. Не используй markdown."""
+async def _get_ctx(db: AsyncSession, run_id: int, user_id: int) -> dict:
+    key = (run_id, user_id)
+    if key in _conversations:
+        return _conversations[key]
 
-RAG_NARRATE_SYSTEM = """Ты — аналитик обращений граждан. У тебя есть данные + конкретные цитаты обращений (пронумерованы [1], [2], ...).
-Сформулируй естественный ответ на русском (3–6 предложений):
-- Опирайся на цифры из данных
-- Где уместно — приводи доводы со ссылками [1], [2], [3] на цитаты
-- Цитаты не вставляй целиком — только ссылайся номером
-- Не используй markdown, только обычный текст"""
+    row_q = await db.execute(
+        select(ChatMemory).where(
+            and_(ChatMemory.run_id == run_id, ChatMemory.user_id == user_id)
+        )
+    )
+    row = row_q.scalar_one_or_none()
+    ctx = _ctx(run_id, user_id)
+    if row and isinstance(row.context, dict):
+        stored = row.context
+        ctx["history"] = stored.get("history", [])[-10:]
+        ctx["last_municipality"] = stored.get("last_municipality")
+        ctx["last_municipalities"] = stored.get("last_municipalities", [])
+        ctx["last_category"] = stored.get("last_category")
+        ctx["last_categories"] = stored.get("last_categories", [])
+        ctx["last_severity"] = stored.get("last_severity")
+    return ctx
 
-FORBIDDEN_SQL = re.compile(
-    r"\b(insert|update|delete|drop|alter|truncate|create|copy|grant|revoke|vacuum|analyze|call|execute)\b",
-    re.IGNORECASE,
-)
 
-ALIASES = {
-    "ЖКХ": ["жкх", "коммун", "отоплен", "отопл", "водоснаб", "воды", "канализац", "трубы", "горячая вода", "холодная вода"],
-    "Дороги": ["дорог", "ям", "асфальт", "тротуар", "разметк"],
-    "Образование": ["школ", "детск сад", "детсад", "образован", "учитель", "учеб"],
-    "Физическая культура и спорт": ["спорт", "физкультур", "стадион", "тренаж", "секци"],
-    "Здравоохранение": ["медицин", "больниц", "поликлиник", "врач", "здравоохран", "лечен", "скорая", "лекарств"],
-    "Благоустройство": ["благоустр", "двор", "снег", "парк ", "сквер", "уборк", "газон", "детск площадк"],
-    "Общественный транспорт": ["автобус", "маршрут", "транспорт", "остановк", "троллейбус", "трамвай", "перевозк"],
-    "Социальное обслуживание и защита": ["социальн", "соцзащит", "пенси", "пособ", "льгот", "инвалид", "ветеран"],
-    "Военная служба": ["военн", "армия", "мобилиз", "сво", "контракт"],
-    "Безопасность и правопорядок": ["безопасн", "полиц", "правопоряд", "правонаруш", "хулиган", "престу"],
-    "Энергетика": ["электр", "энерг", "свет ", "освещен", "фонар", "лэп"],
-    "Экология": ["эколог", "загрязн", "выброс", "воздух", "река"],
-    "Обращение с отходами": ["мусор", "отход", "свалк", "контейнер", "тко"],
-    "Связь и телевидение": ["связь", "телевиден", "интернет", "мобильн", "сигнал", "вышк"],
-    "Строительство и архитектура": ["строит", "стройк", "архитект", "застр", "новостройк"],
-    "Культура": ["культур", "музей", "театр", "библиотек", "дом культур"],
-    "Земельные отношения": ["земельн", "участок", "земля", "межеван", "кадастр"],
-    "Торговля и услуги": ["торгов", "магазин", "услуг", "рынок", "цены"],
-    "Трудовые отношения": ["трудов", "зарплат", "работодател", "увольнен"],
-    "Миграционная политика": ["миграц", "мигрант", "паспорт", "гражданств"],
-    "Туризм": ["туризм", "турист"],
-    "Молодежная политика": ["молодеж"],
-    "Имущественные отношения": ["имуществ", "собственн", "жильё", "жилье", "квартир"],
-    "Регистрация актов гражд. состояния": ["загс", "брак", "развод", "свидетельств о рожд"],
-    "Ветеринария": ["ветеринар", "животн", "собак", "кошк", "бродяч"],
-    "Другое": ["другое", "прочее"],
-}
-
-CHAT_COLUMN_LABELS = {
-    "municipality": "Район",
-    "problem_count": "Проблемных обращений",
-    "appeal_count": "Обращений",
-    "rank": "Ранг",
-    "avg_rank": "Средний ранг",
-    "top_issues": "Ключевые проблемы",
-    "summary_text": "Сводка",
-    "cluster_name": "Проблема",
-    "category": "Категория",
-    "severity": "Тяжесть",
-    "centroid_text": "Выдержка",
-    "cluster_count": "Кластеров",
-    "count": "Количество",
-    "severe_count": "Критичных и высоких",
-    "muni_count": "Муниципалитетов",
-    "category_count": "Категорий",
-    "group_name": "Группа тем",
-    "incident_type": "Тип инцидента",
-    "outcome": "Итог",
-    "incident_text": "Текст обращения",
-    "confidence": "Уверенность",
-}
+async def _save_ctx(db: AsyncSession, run_id: int, user_id: int, ctx: dict) -> None:
+    payload = _memory_payload(ctx)
+    stmt = (
+        pg_insert(ChatMemory)
+        .values(run_id=run_id, user_id=user_id, context=payload)
+        .on_conflict_do_update(
+            index_elements=["run_id", "user_id"],
+            set_={"context": payload, "updated_at": func.now()},
+        )
+    )
+    await db.execute(stmt)
+    await db.commit()
 
 
 def _label_column(column: str) -> str:
     return CHAT_COLUMN_LABELS.get(column, column)
 
 
-async def _call_ollama(prompt: str, system: str = "", timeout: int = 45, temperature: float = 0.1) -> str:
-    request_timeout = min(max(timeout, 10), LLM_TIMEOUT_SECONDS)
+async def _call_ollama(
+    prompt: str,
+    system: str = "",
+    timeout: int = 45,
+    temperature: float = 0.1,
+    model: str | None = None,
+    num_predict: int = 500,
+    json_mode: bool = False,
+) -> str:
+    request_timeout = min(max(timeout, 10), max(CHAT_LLM_TIMEOUT_SECONDS, 10))
+    payload = {
+        "model": model or CHAT_LLM_MODEL,
+        "prompt": prompt,
+        "system": system,
+        "stream": False,
+        "think": False,
+        "options": {"temperature": temperature, "num_predict": num_predict},
+    }
+    if json_mode:
+        payload["format"] = "json"
+
     async with aiohttp.ClientSession() as session:
-        payload = {
-            "model": LLM_MODEL,
-            "prompt": prompt,
-            "system": system,
-            "stream": False,
-            "options": {"temperature": temperature, "num_predict": 500},
-        }
         async with session.post(
             f"{OLLAMA_URL}/api/generate",
             json=payload,
@@ -152,70 +167,7 @@ async def _call_ollama(prompt: str, system: str = "", timeout: int = 45, tempera
             if resp.status != 200:
                 raise HTTPException(500, f"Ollama error: {resp.status}")
             data = await resp.json()
-            return data.get("response", "").strip()
-
-
-def _normalize(value: str) -> str:
-    return re.sub(r"\s+", " ", value.lower().replace("ё", "е")).strip()
-
-
-def _detect_limit(message: str) -> int:
-    norm = _normalize(message)
-    match = re.search(r"(?:топ|top)\D{0,3}(\d{1,2})", norm)
-    if match:
-        return max(1, min(int(match.group(1)), 50))
-    return 10
-
-
-def _detect_categories_all(message: str) -> list[str]:
-    """Detect ALL categories mentioned (для сравнения)."""
-    norm = _normalize(message)
-    found = []
-    for category in CATEGORIES:
-        terms = ALIASES.get(category, [_normalize(category)])
-        if any(term in norm for term in terms) and category not in found:
-            found.append(category)
-    return found
-
-
-def _detect_category(message: str) -> str | None:
-    found = _detect_categories_all(message)
-    return found[0] if found else None
-
-
-def _detect_severity(message: str) -> str | None:
-    norm = _normalize(message)
-    if any(term in norm for term in ["критич", "critical", "аварийн"]):
-        return "CRITICAL"
-    if any(term in norm for term in ["высок", "high"]):
-        return "HIGH"
-    if any(term in norm for term in ["средн", "medium"]):
-        return "MEDIUM"
-    if any(term in norm for term in ["низк", "low"]):
-        return "LOW"
-    return None
-
-
-def _has_follow_up_marker(message: str) -> bool:
-    """'А что в...', 'А там', 'А по этому', 'и там' — пользователь имеет в виду что-то из контекста."""
-    norm = _normalize(message)
-    return bool(re.search(r"\b(а\s+(что|как|там|по|где|сколько|у)|и\s+(там|по)|еще|ещё|подробне|расскажи больше|развернут)\b", norm))
-
-
-def _contains_any(norm: str, terms: list[str]) -> bool:
-    return any(term in norm for term in terms)
-
-
-def _asks_for_compare(norm: str) -> bool:
-    return _contains_any(norm, ["сравн", "по сравнению", "разниц", "отлич", "между"])
-
-
-def _asks_for_districts(norm: str) -> bool:
-    return _contains_any(norm, ["по районам", "район", "муниципал", "территор", "где"])
-
-
-def _asks_for_top(norm: str) -> bool:
-    return _contains_any(norm, ["топ", "рейтинг", "самые проблем", "лидер", "хуже всего", "больше всего"])
+            return ollama_response_text(data)
 
 
 async def _known_municipalities(db: AsyncSession, run_id: int) -> list[str]:
@@ -224,307 +176,551 @@ async def _known_municipalities(db: AsyncSession, run_id: int) -> list[str]:
             SELECT DISTINCT municipality
             FROM appeals
             WHERE run_id = :run_id AND municipality IS NOT NULL AND municipality <> ''
+            ORDER BY municipality
         """),
         {"run_id": run_id},
     )
     return [row[0] for row in result.fetchall() if row[0]]
 
 
-async def _detect_municipalities_all(db: AsyncSession, run_id: int, message: str) -> list[str]:
-    """Detect ALL municipalities mentioned, для сравнения."""
-    norm = _normalize(message)
-    found = []
-    for municipality in await _known_municipalities(db, run_id):
-        muni_norm = _normalize(municipality)
-        short_norm = re.sub(r"\b(муниципальный|район|округ|городской|г\.?)\b", "", muni_norm).strip()
-        if muni_norm and muni_norm in norm and municipality not in found:
-            found.append(municipality)
-        elif short_norm and len(short_norm) >= 4 and short_norm in norm and municipality not in found:
-            found.append(municipality)
-    return found
+async def _known_categories(db: AsyncSession, run_id: int) -> list[str]:
+    result = await db.execute(
+        text("""
+            SELECT category
+            FROM (
+                SELECT DISTINCT category
+                FROM appeals
+                WHERE run_id = :run_id AND category IS NOT NULL AND category <> ''
+                UNION
+                SELECT DISTINCT category
+                FROM problem_clusters
+                WHERE run_id = :run_id AND category IS NOT NULL AND category <> ''
+            ) AS categories
+            ORDER BY category
+        """),
+        {"run_id": run_id},
+    )
+    return [row[0] for row in result.fetchall() if row[0]]
 
 
-async def _detect_municipality(db: AsyncSession, run_id: int, message: str) -> str | None:
-    found = await _detect_municipalities_all(db, run_id, message)
-    return found[0] if found else None
+def _plain_tokens(value: str) -> list[str]:
+    chars = []
+    for char in str(value or "").casefold().replace("ё", "е"):
+        chars.append(char if char.isalnum() else " ")
+    return [part for part in "".join(chars).split() if len(part) >= 2]
 
 
-def _as_list(value: Any) -> list[Any]:
-    if value is None:
+def _candidate_values(
+    question: str,
+    values: list[str],
+    limit: int = 24,
+    allow_prefix: bool = True,
+) -> list[str]:
+    question_tokens = _plain_tokens(question)
+    if not question_tokens:
         return []
-    if isinstance(value, list):
-        return [item for item in value if item]
-    return [value] if value else []
+    question_set = set(question_tokens)
+    question_text = " ".join(question_tokens)
+    scored: list[tuple[int, int, str]] = []
+
+    for value in values:
+        value_tokens = _plain_tokens(value)
+        if not value_tokens:
+            continue
+        value_text = " ".join(value_tokens)
+        score = 0
+        if value_text and f" {value_text} " in f" {question_text} ":
+            score += 20
+        for token in value_tokens:
+            if token in question_set:
+                score += 6
+                continue
+            if allow_prefix and len(token) >= 4:
+                for question_token in question_tokens:
+                    if len(question_token) >= 4 and (
+                        token.startswith(question_token) or question_token.startswith(token)
+                    ):
+                        score += 2
+                        break
+        if score:
+            scored.append((score, len(value), value))
+
+    scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return [value for _, _, value in scored[:limit]]
 
 
-def _append_filters(where: list[str], params: dict[str, Any], category: str | list[str] | None, severity: str | None):
-    categories = _as_list(category)
-    if len(categories) == 1:
-        where.append("category = :category")
-        params["category"] = categories[0]
-    elif categories:
-        where.append("category = ANY(:categories)")
-        params["categories"] = categories
-    if severity:
-        where.append("severity = :severity")
-        params["severity"] = severity
+def _candidate_severities(question: str) -> list[str]:
+    tokens = _plain_tokens(question)
+    severities: list[str] = []
+
+    def add(value: str) -> None:
+        if value not in severities:
+            severities.append(value)
+
+    for token in tokens:
+        if token.startswith("критич") or token == "critical":
+            add("CRITICAL")
+        if token.startswith("высок") or token == "high":
+            add("HIGH")
+        if token.startswith("средн") or token == "medium":
+            add("MEDIUM")
+        if token.startswith("низк") or token == "low":
+            add("LOW")
+    return severities
 
 
-async def _fast_intent(message: str, run_id: int, db: AsyncSession, user_id: int = 0) -> tuple[str, dict[str, Any], str] | None:
-    norm = _normalize(message)
-    ctx = _ctx(run_id, user_id)
-    limit = _detect_limit(message)
-    category = _detect_category(message)
-    severity = _detect_severity(message)
-    municipality = await _detect_municipality(db, run_id, message)
-    all_categories = _detect_categories_all(message)
-    all_munis = await _detect_municipalities_all(db, run_id, message)
-    asks_compare = _asks_for_compare(norm)
-    asks_districts = _asks_for_districts(norm)
-    asks_top = _asks_for_top(norm)
-    explicit_category = category
-    explicit_severity = severity
-    explicit_municipality = municipality
-    category_filter: str | list[str] | None = category
+def _parse_json_object(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except Exception:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            value = json.loads(raw[start : end + 1])
+        except Exception:
+            return {}
+    return value if isinstance(value, dict) else {}
 
-    # Follow-up resolution: use sticky context
-    if _has_follow_up_marker(message) or (not explicit_municipality and not explicit_category and not explicit_severity):
-        if not category:
-            saved_categories = _as_list(ctx.get("last_categories"))
-            if saved_categories:
-                category_filter = saved_categories
-                category = saved_categories[0] if len(saved_categories) == 1 else None
-            elif ctx.get("last_category"):
-                category = ctx["last_category"]
-                category_filter = category
-        if not municipality and not asks_districts and ctx.get("last_municipality"):
-            municipality = ctx["last_municipality"]
 
-    categories_in_filter = _as_list(category_filter)
-    has_category_filter = bool(categories_in_filter)
+SQL_PLANNER_SYSTEM = """Ты строишь один безопасный PostgreSQL SELECT для аналитического чата по обращениям граждан.
+Верни строго JSON:
+{
+  "sql": "SELECT ...",
+  "title": "короткое название результата",
+  "answer_hint": "что пользователь увидит в таблице",
+  "municipalities": ["точные названия из known_municipalities"],
+  "categories": ["точные названия из known_categories"],
+  "severity": "CRITICAL|HIGH|MEDIUM|LOW|null"
+}
+Никакого текста вне JSON.
 
-    # Update sticky context
-    if municipality:
-        ctx["last_municipality"] = municipality
-    if explicit_category:
-        ctx["last_category"] = explicit_category
-        ctx["last_categories"] = [explicit_category]
-    elif categories_in_filter:
-        ctx["last_category"] = categories_in_filter[0] if len(categories_in_filter) == 1 else None
-        ctx["last_categories"] = categories_in_filter
-    if severity:
-        ctx["last_severity"] = severity
+Схема:
+- appeals(id, run_id, municipality, group_name, incident_type, outcome, incident_text, is_problem, severity, category, confidence, sentiment)
+- problem_clusters(id, run_id, municipality, cluster_name, description, category, severity, appeal_count, rank, rank_score, topic_diversity, centroid_text)
+- summaries(id, run_id, municipality, rank, problem_count, avg_rank, top_issues, summary_text)
 
-    # === COMPARISON: две категории или два района ===
-    if asks_compare and len(all_categories) >= 2:
-        compared_categories = all_categories[:5]
-        ctx["last_category"] = None
-        ctx["last_categories"] = compared_categories
+Обязательные правила:
+- Только SELECT.
+- Всегда фильтруй run_id = :run_id.
+- Не используй параметры кроме :run_id; остальные фильтры пиши строковыми литералами.
+- Всегда добавляй LIMIT от 1 до 50.
+- Для appeals всегда добавляй is_problem = true, если вопрос не просит исходные непрофильные обращения.
+- known_municipalities содержит только релевантные кандидаты из БД, а не весь список районов.
+- Используй только точные категории из known_categories и точные муниципалитеты из known_municipalities.
+- candidate_categories и candidate_municipalities уже отфильтрованы из БД под вопрос пользователя. Если список непустой и вопрос называет такую сущность, выбирай из него.
+- Если candidate_categories пустой, не добавляй category IN со всеми категориями.
+- Если candidate_municipalities пустой, не добавляй municipality IN со всеми муниципалитетами.
+- Если known_municipalities пустой, в WHERE запрещены любые фильтры по municipality.
+- Короткие названия пользователя сопоставляй с точными значениями из known_municipalities.
+- "Омская область" без слова "другое" означает весь набор данных run_id, а не муниципалитет "Омская область, другое".
+- Для вопроса "в Омской области" SQL должен идти по всему run_id без условия municipality.
+- В SQL всегда пиши run_id = :run_id, не подставляй числовой run_id.
+- Если пользователь просит проблемы, критические проблемы, расписать проблемы, причины или детализацию, используй problem_clusters.
+- Для problem_clusters выбирай понятные поля: municipality, category, cluster_name, appeal_count, severity, description AS explanation, centroid_text AS example.
+- Если пользователь просит категорию с тяжестью, фильтруй и category, и severity.
+- Если candidate_severities непустой, SQL обязан фильтровать ровно эти уровни тяжести.
+- "критические" означает severity = 'CRITICAL'. "критичные и высокие" означает severity IN ('CRITICAL','HIGH').
+- Не добавляй severity, если пользователь явно не назвал тяжесть. Слово "проблемы" само по себе не означает CRITICAL или HIGH.
+- Если пользователь просит топ категорий, группируй appeals по category и добавляй COUNT(*) AS problem_count, тяжелые обращения, охват муниципалитетов и долю.
+- Если пользователь просит топ районов или рейтинг районов, используй summaries и добавляй summary_text AS explanation.
+- Если пользователь просит сравнить районы, верни только сравниваемые районы из summaries и добавь top_issues, summary_text AS explanation.
+- Для сравнения двух и более муниципалитетов всегда используй summaries, не problem_clusters.
+- Если пользователь просит сравнить категории, группируй appeals только по сравниваемым категориям.
+- Не превращай запрос о проблемах в рейтинг районов, если пользователь явно не просит районы, рейтинг или где больше.
+- current_context и recent_history используй только если новый вопрос явно продолжает прошлый. Если вопрос самостоятельный, не переноси старые category, municipality или severity.
+"""
+
+
+SQL_REVIEW_SYSTEM = """Проверь, отвечает ли SQL точному вопросу пользователя.
+Верни строго JSON:
+{
+  "ok": true,
+  "sql": "SELECT ...",
+  "title": "короткое название результата",
+  "answer_hint": "что пользователь увидит в таблице",
+  "municipalities": [],
+  "categories": [],
+  "severity": null
+}
+
+Если SQL не отвечает вопросу, верни ok=false и исправленный SQL в том же поле sql.
+Если во входном JSON есть validation_error, исправь SQL так, чтобы ошибка исчезла.
+sql не может быть null: всегда верни исправленный SELECT.
+Проверяй особенно:
+- названные категории и уровни тяжести должны быть в WHERE;
+- не добавляй severity, если пользователь явно не назвал тяжесть; обычное слово "проблемы" не означает CRITICAL;
+- сравнение должно возвращать только сравниваемые сущности;
+- сравнение двух и более муниципалитетов должно использовать summaries;
+- запрос "проблемы/распиши/критические проблемы" должен идти в problem_clusters с explanation и example;
+- "Омская область" без слова "другое" означает весь run_id, не один муниципалитет;
+- если known_municipalities пустой, исправленный SQL не должен иметь municipality в WHERE;
+- run_id должен оставаться параметром :run_id;
+- общий список проблем не должен превращаться в топ районов.
+- не переноси фильтры из current_context, если новый вопрос самостоятельный.
+Никакого текста вне JSON.
+"""
+
+
+ANSWER_SYSTEM = """Сформулируй ответ для аналитического чата.
+Верни строго JSON {"answer": "..."}.
+Правила:
+- 1-3 коротких предложения на русском.
+- Сразу итог, без рассуждений и без markdown.
+- Объясни, какие фильтры и смысл таблицы: что является строкой, что означает счетчик, где смотреть пояснение/пример.
+- Не добавляй факты, которых нет в данных.
+"""
+
+
+def _compact_sql(sql: str) -> str:
+    return " ".join(str(sql or "").strip().split())
+
+
+def _sql_tokens(sql: str) -> list[str]:
+    chars = []
+    for ch in str(sql or "").lower():
+        if ch.isalnum() or ch in {"_", ":"}:
+            chars.append(ch)
+        else:
+            chars.append(" ")
+    return [part for part in "".join(chars).split() if part]
+
+
+def _validate_model_sql(sql: Any) -> str | None:
+    sql = _compact_sql(str(sql or ""))
+    if sql.endswith(";"):
+        sql = sql[:-1].strip()
+    lowered = sql.lower()
+    if not lowered.startswith("select "):
+        return None
+    if ";" in sql or "--" in lowered or "/*" in lowered or "*/" in lowered:
+        return None
+    if ":run_id" not in lowered:
+        return None
+
+    tokens = _sql_tokens(sql)
+    forbidden = {
+        "insert", "update", "delete", "drop", "alter", "truncate", "create",
+        "copy", "grant", "revoke", "vacuum", "analyze", "call", "execute",
+    }
+    if any(token in forbidden for token in tokens):
+        return None
+
+    allowed_tables = {"appeals", "problem_clusters", "summaries", "appeal_cluster_map"}
+    for index, token in enumerate(tokens[:-1]):
+        if token in {"from", "join"} and tokens[index + 1] not in allowed_tables:
+            return None
+
+    params = [token for token in tokens if token.startswith(":")]
+    if any(param != ":run_id" for param in params):
+        return None
+
+    if "limit" not in tokens:
+        sql = f"{sql} LIMIT 50"
+        tokens = _sql_tokens(sql)
+    if "order" not in tokens:
+        order_by = None
+        if "problem_clusters" in tokens and "appeal_count" in tokens:
+            order_by = "ORDER BY appeal_count DESC"
+        elif "summaries" in tokens and "problem_count" in tokens:
+            order_by = "ORDER BY problem_count DESC"
+        if order_by:
+            lowered_sql = sql.lower()
+            limit_index = lowered_sql.rfind(" limit ")
+            if limit_index >= 0:
+                sql = f"{sql[:limit_index].strip()} {order_by}{sql[limit_index:]}"
+            else:
+                sql = f"{sql} {order_by}"
+    return sql
+
+
+def _clean_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    raw_severity = plan.get("severity")
+    raw_severities = plan.get("severities")
+    severity_values: list[str] = []
+    if isinstance(raw_severities, list):
+        source = " ".join(str(item).upper() for item in raw_severities)
+    else:
+        source = str(raw_severity or "").upper()
+    for value in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+        if value in source:
+            severity_values.append(value)
+
+    return {
+        "sql": plan.get("sql"),
+        "title": str(plan.get("title") or "").strip(),
+        "answer_hint": str(plan.get("answer_hint") or "").strip(),
+        "municipalities": [
+            str(item).strip()
+            for item in (plan.get("municipalities") or [])
+            if str(item).strip()
+        ],
+        "categories": [
+            str(item).strip()
+            for item in (plan.get("categories") or [])
+            if str(item).strip()
+        ],
+        "severity": "|".join(severity_values) if severity_values else None,
+        "severities": severity_values,
+    }
+
+
+def _filter_plan_entities(
+    plan: dict[str, Any],
+    candidate_municipalities: list[str],
+    known_categories: list[str],
+) -> dict[str, Any]:
+    muni_set = set(candidate_municipalities)
+    category_set = set(known_categories)
+    plan["municipalities"] = [
+        item for item in (plan.get("municipalities") or [])
+        if item in muni_set
+    ]
+    plan["categories"] = [
+        item for item in (plan.get("categories") or [])
+        if item in category_set
+    ]
+    return plan
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _plan_semantic_issue(
+    sql: str,
+    plan: dict[str, Any],
+    all_municipalities: list[str],
+    candidate_municipalities: list[str],
+    candidate_categories: list[str],
+    candidate_severities: list[str],
+) -> str | None:
+    compact = _compact_sql(sql)
+    lowered = compact.lower()
+    where_tail = ""
+    if " where " in lowered:
+        where_tail = lowered.split(" where ", 1)[1]
+    candidate_muni_set = set(candidate_municipalities)
+
+    municipality_filter_markers = (
+        " municipality =",
+        ".municipality =",
+        " municipality in",
+        ".municipality in",
+        " municipality like",
+        ".municipality like",
+    )
+    has_municipality_filter = any(marker in where_tail for marker in municipality_filter_markers)
+    if has_municipality_filter and not candidate_municipalities:
         return (
-            """
-            SELECT category, COUNT(*) AS problem_count,
-                   COUNT(*) FILTER (WHERE severity IN ('CRITICAL','HIGH')) AS severe_count,
-                   COUNT(DISTINCT municipality) AS muni_count
-            FROM appeals
-            WHERE run_id = :run_id AND is_problem = true AND category = ANY(:cats)
-            GROUP BY category
-            """,
-            {"run_id": run_id, "cats": compared_categories},
-            "category_compare",
+            "Ошибка: SQL фильтрует municipality, но candidate_municipalities пустой. "
+            "Убери все условия municipality из WHERE. Для фразы 'в Омской области' "
+            "используй весь run_id без фильтра municipality."
         )
 
-    if asks_compare and len(all_munis) >= 2:
+    tokens = _sql_tokens(sql)
+    if len(candidate_municipalities) >= 2 and "summaries" not in tokens:
         return (
-            """
-            SELECT municipality, problem_count, ROUND(avg_rank::numeric, 1) AS avg_rank, top_issues
-            FROM summaries
-            WHERE run_id = :run_id AND municipality = ANY(:munis)
-            """,
-            {"run_id": run_id, "munis": all_munis[:5]},
-            "muni_compare",
+            "Ошибка: вопрос сравнивает несколько муниципалитетов. Для такого сравнения "
+            "нужно использовать таблицу summaries и вернуть только эти муниципалитеты."
+        )
+    if len(candidate_municipalities) >= 2 and "summaries" in tokens and "category" in tokens:
+        return (
+            "Ошибка: в таблице summaries нет поля category. Для сравнения муниципалитетов "
+            "верни municipality, rank, problem_count, avg_rank, top_issues и summary_text."
+        )
+    if len(candidate_municipalities) >= 2 and "summaries" in tokens:
+        required = {"municipality", "rank", "problem_count", "avg_rank", "top_issues"}
+        missing = sorted(required.difference(tokens))
+        if missing:
+            return (
+                "Ошибка: для сравнения муниципалитетов в summaries не хватает колонок "
+                f"{missing!r}. Верни municipality, rank, problem_count, avg_rank, top_issues, summary_text."
+            )
+    if len(candidate_municipalities) >= 2 and " or " in where_tail:
+        return (
+            "Ошибка: для сравнения нескольких муниципалитетов используй "
+            "municipality IN (...), а не OR, чтобы фильтр run_id применялся ко всем строкам."
         )
 
-    # === SEVERITY BREAKDOWN by district/category ===
-    asks_severity_breakdown = "тяжест" in norm or "критич" in norm and ("где" in norm or "район" in norm)
-    if asks_severity_breakdown and not severity:
-        where = ["run_id = :run_id", "is_problem = true", "severity IS NOT NULL"]
-        params: dict[str, Any] = {"run_id": run_id, "limit": limit}
-        _append_filters(where, params, category_filter, None)
-        return (
-            f"""
-            SELECT municipality, severity, COUNT(*) AS count
-            FROM appeals
-            WHERE {' AND '.join(where)}
-            GROUP BY municipality, severity
-            ORDER BY count DESC
-            LIMIT :limit
-            """,
-            params,
-            "severity_by_muni",
-        )
+    for municipality in all_municipalities:
+        if _sql_literal(municipality) not in compact:
+            continue
+        if municipality not in candidate_muni_set:
+            return (
+                f"Ошибка: SQL фильтрует municipality {municipality!r}, но этого значения "
+                "нет в candidate_municipalities. Убери этот фильтр или используй только "
+                "candidate_municipalities."
+            )
 
-    # === COUNT ===
-    asks_count = any(term in norm for term in ["сколько", "количество", "число "])
-    if asks_count and (has_category_filter or severity) and not municipality:
-        where = ["run_id = :run_id", "is_problem = true"]
-        params = {"run_id": run_id}
-        _append_filters(where, params, category_filter, severity)
-        return (
-            f"""
-            SELECT COUNT(*) AS problem_count
-            FROM appeals
-            WHERE {' AND '.join(where)}
-            LIMIT 1
-            """,
-            params,
-            "count",
-        )
+    for category in candidate_categories:
+        if _sql_literal(category) not in compact:
+            return f"Ошибка: вопрос выбрал категорию {category!r}; SQL обязан фильтровать эту категорию."
 
-    # === CATEGORY SUMMARY across districts ===
-    if has_category_filter and not municipality and (asks_districts or asks_top or "сводк" in norm or "распредел" in norm):
-        where = ["run_id = :run_id", "is_problem = true"]
-        district_limit = limit if asks_top else 50
-        params = {"run_id": run_id, "limit": district_limit}
-        _append_filters(where, params, category_filter, severity)
-        return (
-            f"""
-            SELECT municipality,
-                   COUNT(*) AS problem_count,
-                   COUNT(*) FILTER (WHERE severity IN ('CRITICAL','HIGH')) AS severe_count,
-                   COUNT(DISTINCT category) AS category_count
-            FROM appeals
-            WHERE {' AND '.join(where)}
-            GROUP BY municipality
-            ORDER BY problem_count DESC
-            LIMIT :limit
-            """,
-            params,
-            "category_summary",
-        )
-
-    # === TOP DISTRICTS ===
-    asks_top_districts = asks_top and _contains_any(norm, ["район", "муниципалит", "област"])
-    if asks_top_districts:
-        district_limit = limit if asks_top else 50
-        return (
-            """
-            SELECT municipality, problem_count, ROUND(avg_rank::numeric, 1) AS avg_rank, top_issues, summary_text
-            FROM summaries
-            WHERE run_id = :run_id
-            ORDER BY rank
-            LIMIT :limit
-            """,
-            {"run_id": run_id, "limit": district_limit},
-            "district_top",
-        )
-
-    if asks_districts and not municipality and not has_category_filter:
-        return (
-            """
-            SELECT municipality, problem_count, ROUND(avg_rank::numeric, 1) AS avg_rank, top_issues, summary_text
-            FROM summaries
-            WHERE run_id = :run_id
-            ORDER BY rank
-            LIMIT :limit
-            """,
-            {"run_id": run_id, "limit": 50},
-            "district_top",
-        )
-
-    # === MUNICIPALITY PROBLEMS ===
-    if municipality:
-        where = ["run_id = :run_id", "municipality = :municipality"]
-        params = {"run_id": run_id, "municipality": municipality, "limit": 50}
-        _append_filters(where, params, category_filter, severity)
-        return (
-            f"""
-            SELECT cluster_name, appeal_count, rank, category, severity, centroid_text
-            FROM problem_clusters
-            WHERE {' AND '.join(where)}
-            ORDER BY rank
-            LIMIT :limit
-            """,
-            params,
-            "municipality_problems",
-        )
-
-    # === CATEGORY SUMMARY across districts ===
-    if has_category_filter and any(term in norm for term in ["сводк", "район", "где", "топ"]):
-        where = ["run_id = :run_id"]
-        params = {"run_id": run_id, "limit": limit}
-        _append_filters(where, params, category_filter, severity)
-        return (
-            f"""
-            SELECT municipality, SUM(appeal_count) AS problem_count, COUNT(*) AS cluster_count
-            FROM problem_clusters
-            WHERE {' AND '.join(where)}
-            GROUP BY municipality
-            ORDER BY problem_count DESC
-            LIMIT :limit
-            """,
-            params,
-            "category_summary",
-        )
-
-    if has_category_filter or severity:
-        where = ["run_id = :run_id"]
-        params = {"run_id": run_id, "limit": 50}
-        _append_filters(where, params, category_filter, severity)
-        return (
-            f"""
-            SELECT municipality, cluster_name, appeal_count, rank, category, severity, centroid_text
-            FROM problem_clusters
-            WHERE {' AND '.join(where)}
-            ORDER BY appeal_count DESC
-            LIMIT :limit
-            """,
-            params,
-            "cluster_list",
-        )
-
-    if any(term in norm for term in ["главн", "ключев", "проблем"]):
-        return (
-            """
-            SELECT municipality, cluster_name, appeal_count, rank, category, severity, centroid_text
-            FROM problem_clusters
-            WHERE run_id = :run_id
-            ORDER BY appeal_count DESC
-            LIMIT :limit
-            """,
-            {"run_id": run_id, "limit": limit},
-            "cluster_list",
-        )
+    for severity in candidate_severities:
+        if _sql_literal(severity) not in compact:
+            return f"Ошибка: вопрос выбрал тяжесть {severity!r}; SQL обязан фильтровать эту тяжесть."
+    if len(candidate_severities) == 1:
+        extra = [
+            value for value in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+            if value not in candidate_severities and _sql_literal(value) in compact
+        ]
+        if extra:
+            return (
+                f"Ошибка: вопрос выбрал только тяжесть {candidate_severities[0]!r}; "
+                f"SQL не должен добавлять {extra!r}."
+            )
 
     return None
 
 
-def _extract_sql(text_resp: str) -> str | None:
-    text_resp = re.sub(r"```sql\s*", "", text_resp, flags=re.IGNORECASE)
-    text_resp = re.sub(r"```\s*", "", text_resp)
-    match = re.search(r"(SELECT\s.+?)(?:;|$)", text_resp.strip(), re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    sql = match.group(1).strip().rstrip(";")
-    if not re.match(r"^\s*SELECT\s", sql, re.IGNORECASE):
-        return None
-    if ";" in sql or FORBIDDEN_SQL.search(sql):
-        return None
-    if "LIMIT" not in sql.upper():
-        sql += " LIMIT 50"
-    return sql
+def _repair_plan_from_candidates(
+    message: str,
+    candidate_municipalities: list[str],
+    candidate_categories: list[str],
+    candidate_severities: list[str],
+) -> dict[str, Any] | None:
+    if len(candidate_municipalities) >= 2:
+        values = ", ".join(_sql_literal(value) for value in candidate_municipalities[:5])
+        return {
+            "sql": (
+                "SELECT municipality, rank, problem_count, ROUND(avg_rank::numeric, 1) AS avg_rank, "
+                f"top_issues, summary_text AS explanation FROM summaries WHERE run_id = :run_id "
+                f"AND municipality IN ({values}) LIMIT 50"
+            ),
+            "title": "Сравнение муниципалитетов",
+            "answer_hint": "Таблица сравнивает выбранные муниципалитеты по рангу, количеству проблем и ключевым проблемам.",
+            "municipalities": candidate_municipalities[:5],
+            "categories": [],
+            "severity": None,
+            "severities": [],
+        }
+
+    if candidate_categories or candidate_severities:
+        filters = ["run_id = :run_id"]
+        if candidate_categories:
+            values = ", ".join(_sql_literal(value) for value in candidate_categories[:5])
+            filters.append(f"category IN ({values})")
+        if candidate_severities:
+            values = ", ".join(_sql_literal(value) for value in candidate_severities)
+            filters.append(f"severity IN ({values})")
+        return {
+            "sql": (
+                "SELECT municipality, category, cluster_name, appeal_count, severity, "
+                "description AS explanation, centroid_text AS example "
+                f"FROM problem_clusters WHERE {' AND '.join(filters)} "
+                "ORDER BY appeal_count DESC LIMIT 50"
+            ),
+            "title": "Проблемные кластеры",
+            "answer_hint": "Таблица показывает повторяющиеся проблемы с количеством обращений, пояснением и примером.",
+            "municipalities": [],
+            "categories": candidate_categories[:5],
+            "severity": "|".join(candidate_severities) if candidate_severities else None,
+            "severities": candidate_severities,
+        }
+
+    return {
+        "sql": (
+            "SELECT municipality, category, cluster_name, appeal_count, severity, "
+            "description AS explanation, centroid_text AS example "
+            "FROM problem_clusters WHERE run_id = :run_id ORDER BY appeal_count DESC LIMIT 50"
+        ),
+        "title": "Проблемные кластеры",
+        "answer_hint": "Таблица показывает повторяющиеся проблемы с количеством обращений, пояснением и примером.",
+        "municipalities": [],
+        "categories": [],
+        "severity": None,
+        "severities": [],
+    }
 
 
-def _validate_llm_sql(sql: str, run_id: int) -> bool:
-    normalized = _normalize(sql)
-    if FORBIDDEN_SQL.search(sql) or ";" in sql:
-        return False
-    if not normalized.startswith("select "):
-        return False
-    if " run_id" not in normalized and ".run_id" not in normalized:
-        return False
-    if str(run_id) not in normalized:
-        return False
-    return True
+async def _model_sql_plan(message: str, run_id: int, db: AsyncSession, ctx: dict) -> dict[str, Any]:
+    municipalities = await _known_municipalities(db, run_id)
+    categories = await _known_categories(db, run_id)
+    candidate_municipalities = _candidate_values(message, municipalities, allow_prefix=False)
+    candidate_categories = _candidate_values(message, categories)
+    candidate_severities = _candidate_severities(message)
+    payload = {
+        "run_id": run_id,
+        "question": message,
+        "current_context": {},
+        "recent_history": [],
+        "known_municipalities": candidate_municipalities,
+        "known_categories": candidate_categories,
+        "candidate_municipalities": candidate_municipalities,
+        "candidate_categories": candidate_categories,
+        "candidate_severities": candidate_severities,
+        "allowed_severity": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+    }
+    raw = await _call_ollama(
+        json.dumps(payload, ensure_ascii=False),
+        SQL_PLANNER_SYSTEM,
+        timeout=CHAT_LLM_TIMEOUT_SECONDS,
+        temperature=0,
+        model=CHAT_INTENT_MODEL,
+        num_predict=650,
+        json_mode=True,
+    )
+    plan = _clean_plan(_parse_json_object(raw))
+    plan = _filter_plan_entities(plan, candidate_municipalities, candidate_categories)
+    checked_sql = _validate_model_sql(plan.get("sql"))
+    initial_issue = None
+    if checked_sql:
+        plan["sql"] = checked_sql
+        initial_issue = _plan_semantic_issue(
+            checked_sql,
+            plan,
+            municipalities,
+            candidate_municipalities,
+            candidate_categories,
+            candidate_severities,
+        )
+        if not initial_issue:
+            return plan
+
+    repaired = _repair_plan_from_candidates(
+        message,
+        candidate_municipalities,
+        candidate_categories,
+        candidate_severities,
+    )
+    if repaired and _validate_model_sql(repaired.get("sql")):
+        return repaired
+
+    review_payload = {
+        **payload,
+        "candidate_plan": plan,
+        "validation_error": initial_issue,
+    }
+    review_raw = await _call_ollama(
+        json.dumps(review_payload, ensure_ascii=False),
+        SQL_REVIEW_SYSTEM,
+        timeout=CHAT_LLM_TIMEOUT_SECONDS,
+        temperature=0,
+        model=CHAT_INTENT_MODEL,
+        num_predict=650,
+        json_mode=True,
+    )
+    review = _clean_plan(_parse_json_object(review_raw))
+    review = _filter_plan_entities(review, candidate_municipalities, candidate_categories)
+    review_sql = _validate_model_sql(review.get("sql"))
+    if review_sql:
+        review["sql"] = review_sql
+        review_issue = _plan_semantic_issue(
+            review_sql,
+            review,
+            municipalities,
+            candidate_municipalities,
+            candidate_categories,
+            candidate_severities,
+        )
+        if not review_issue and (review.get("title") or review.get("answer_hint")):
+            return review
+    if checked_sql and not initial_issue:
+        return plan
+    plan["sql"] = None
+    return plan
 
 
 async def _run_sql(db: AsyncSession, sql: str, params: dict[str, Any] | None = None) -> tuple[list[str], list[dict]]:
@@ -537,6 +733,8 @@ async def _run_sql(db: AsyncSession, sql: str, params: dict[str, Any] | None = N
 
 
 def _json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return value
@@ -549,10 +747,8 @@ def _serialize_data(data: list[dict]) -> list[dict]:
 def _display_value(key: str, value: Any) -> Any:
     if key == "top_issues":
         return _format_top_issues(value)
-    if key == "severity":
-        return format_severity(value)
-    if isinstance(value, str) and value in {"CRITICAL", "HIGH", "MEDIUM", "LOW"}:
-        return format_severity(value)
+    if key == "severity" and isinstance(value, str):
+        return SEVERITY_LABELS.get(value, value)
     return value
 
 
@@ -575,184 +771,66 @@ def _format_top_issues(top_issues: Any) -> str:
     for issue in top_issues[:3]:
         if not isinstance(issue, dict):
             continue
-        parts.append(f"{issue.get('name', '')} ({issue.get('count', 0)})")
+        name = issue.get("name") or issue.get("category") or ""
+        count = issue.get("count", 0)
+        if name:
+            parts.append(f"{name} ({count})")
     return ", ".join(parts)
 
 
-def _make_answer(kind: str, data: list[dict], message: str) -> str:
-    if not data:
-        return "По этому запросу ничего не найдено."
-
-    if kind == "count":
-        row = data[0]
-        count = row.get("problem_count", 0)
-        return f"Найдено {count} обращений по запросу. Значение показано в таблице ниже."
-
-    if kind == "category_compare":
-        return f"Сравнение категорий готово: {len(data)} строк. Количество проблем, тяжелые обращения и охват по районам — в таблице ниже."
-
-    if kind == "muni_compare":
-        return f"Сравнение районов готово: {len(data)} строк. Количество обращений, средний ранг и ключевые проблемы — в таблице ниже."
-
-    if kind == "severity_by_muni":
-        return f"Разбивка по тяжести готова: {len(data)} строк. Районы, уровни тяжести и количество обращений — в таблице ниже."
-
-    if kind == "district_top":
-        return f"Сформировал список районов: {len(data)} строк. Ранг, количество обращений и ключевые проблемы — в таблице ниже."
-
-    if kind == "category_summary":
-        return f"Сформировал сводку по категории: {len(data)} строк. Районы, количество обращений и критичные/высокие случаи — в таблице ниже."
-
-    if kind == "municipality_problems":
-        return f"Нашёл проблемы по выбранному району: {len(data)} строк. Названия кластеров, количество обращений, категория и тяжесть — в таблице ниже."
-
-    return f"Нашёл проблемные кластеры по запросу: {len(data)} строк. Районы, темы, количество обращений, тяжесть и выдержки — в таблице ниже."
-
-
-async def _fetch_citations(
-    db: AsyncSession,
-    run_id: int,
-    data: list[dict],
-    limit: int = 3,
-    category: str | list[str] | None = None,
-    severity: str | None = None,
-) -> list[dict]:
-    """Подтянуть 3 конкретных обращения для цитирования по результатам запроса.
-
-    Стратегия: если в результатах есть municipality+category — берём оттуда
-    реальные тексты из appeals. Если есть cluster — выгружаем appeals кластера.
-    """
-    if not data:
-        return []
-
-    munis = list({row.get("municipality") for row in data if row.get("municipality")})[:3]
-    cats = list({row.get("category") for row in data if row.get("category")})[:3]
-    context_cats = _as_list(category)
-    if context_cats and not cats:
-        cats = context_cats[:3]
-
-    if not munis and not cats:
-        return []
-
-    display_category = appeal_display_category().label("display_category")
-    display_severity = appeal_display_severity().label("display_severity")
-    conds = [Appeal.run_id == run_id, Appeal.is_problem == True]
-    if munis:
-        conds.append(Appeal.municipality.in_(munis))
-    if cats:
-        conds.append(display_category.in_(cats))
-    if severity:
-        conds.append(display_severity == severity)
-
-    res = await db.execute(
-        select(Appeal, display_category, display_severity)
-        .where(and_(*conds))
-        .order_by(Appeal.confidence.desc().nullslast())
-        .limit(limit)
-    )
-    return [
-        {
-            "id": a.id,
-            "text": (a.incident_text or "")[:400],
-            "municipality": a.municipality,
-            "category": category_value(display_category),
-            "severity": severity_value(display_severity),
-        }
-        for a, display_category, display_severity in res.all()
-    ]
-
-
-async def _narrate_with_rag(
+async def _model_answer(
     message: str,
-    kind: str,
+    plan: dict[str, Any],
+    columns: list[str],
     data: list[dict],
-    citations: list[dict],
-) -> str | None:
-    """RAG-narration: LLM получает данные + цитаты, отвечает со ссылками [1][2]."""
-    if not data or not citations:
-        return None
-    compact_data = [{k: (v[:120] if isinstance(v, str) else v) for k, v in row.items()} for row in data[:6]]
-    cites_str = "\n".join(
-        f"[{i+1}] {c['municipality']} · {c['category']}: {c['text'][:300]}"
-        for i, c in enumerate(citations)
-    )
-    prompt = f"""Вопрос: {message}
-
-Тип запроса: {kind}
-
-Агрегированные данные (JSON):
-{json.dumps(compact_data, ensure_ascii=False, default=str)[:1400]}
-
-Конкретные обращения для цитирования:
-{cites_str}
-
-Сформулируй ответ:"""
-    try:
-        text_resp = await _call_ollama(prompt, RAG_NARRATE_SYSTEM, timeout=25, temperature=0.3)
-        if not text_resp or len(text_resp) > 2000:
-            return None
-        return text_resp.strip()
-    except Exception:
-        return None
-
-
-async def _narrate(message: str, kind: str, data: list[dict]) -> str | None:
-    """LLM-генерирует человеческий ответ по данным. Fallback на табличный _make_answer."""
+) -> str:
     if not data:
-        return None
-    # Сжимаем данные для промпта: до 8 строк, обрезаем длинные тексты
-    compact = []
-    for row in data[:8]:
-        compact_row = {}
-        for k, v in row.items():
-            if isinstance(v, str):
-                compact_row[k] = v[:150]
-            else:
-                compact_row[k] = v
-        compact.append(compact_row)
+        return "По этому запросу в обработанных данных ничего не найдено."
 
-    prompt = f"""Вопрос пользователя: {message}
+    column_set = set(columns)
+    row_count = len(data)
+    row_word = "строка" if row_count == 1 else "строки" if 2 <= row_count <= 4 else "строк"
+    hint = str(plan.get("answer_hint") or "").strip()
 
-Тип ответа: {kind}
-Данные (JSON, до 8 строк):
-{json.dumps(compact, ensure_ascii=False, default=str)[:2000]}
+    if {"municipality", "rank", "problem_count"}.issubset(column_set):
+        return (
+            f"Сравнил выбранные муниципалитеты: {row_count} {row_word}. "
+            "Строка — район, «Проблемных обращений» — общее количество проблем, "
+            "«Ключевые проблемы» показывает основные темы и их числа."
+        )
 
-Сформулируй короткий, естественный ответ:"""
-    try:
-        text_resp = await _call_ollama(prompt, NARRATE_SYSTEM, timeout=20, temperature=0.3)
-        # Защита от слишком длинного или пустого ответа
-        if not text_resp or len(text_resp) > 1500:
-            return None
-        return text_resp.strip()
-    except Exception:
-        return None
+    if "cluster_name" in column_set:
+        return (
+            f"Показал проблемные кластеры: {row_count} {row_word}. "
+            "Строка — отдельная повторяющаяся проблема; счетчик показывает число обращений. "
+            "Пояснение и пример раскрывают суть проблемы."
+        )
+
+    if "category" in column_set and "municipality" not in column_set:
+        return (
+            f"Показал категории: {row_count} {row_word}. "
+            "Строка — категория, счетчики показывают количество проблемных обращений и тяжелых случаев."
+        )
+
+    if hint:
+        return hint
+    if plan.get("title"):
+        return f"{plan['title']}: {row_count} строк."
+    return f"Показал результат по запросу: {row_count} строк."
 
 
-def _suggestions(kind: str, data: list[dict], ctx: dict) -> list[str]:
-    """Предложить 2-3 follow-up вопроса."""
-    out = []
-    if kind == "district_top" and data:
-        top1 = data[0].get("municipality")
-        if top1:
-            out.append(f"Расскажи подробнее про {top1}")
-        out.append("Какие категории чаще всего жалуются?")
-    elif kind == "municipality_problems":
-        if ctx.get("last_municipality"):
-            out.append(f"Сравни {ctx['last_municipality']} с Омском")
-        out.append("Покажи только критические проблемы")
-    elif kind == "category_summary" and data:
-        out.append("Покажи топ районов")
-        if ctx.get("last_category"):
-            out.append(f"Какая тяжесть у {ctx['last_category']}?")
-    elif kind == "count":
-        out.append("Покажи по районам")
-        out.append("Какие критические?")
-    elif kind in ("cluster_list", "category_compare"):
-        out.append("Покажи топ-10 районов")
-        out.append("Какие проблемы у этих кластеров?")
-    else:
-        out = ["Топ-10 районов", "Критические проблемы ЖКХ", "Сводка по дорогам"]
-    return out[:3]
+def _update_context_from_plan(ctx: dict, plan: dict[str, Any]) -> None:
+    municipalities = plan.get("municipalities") or []
+    categories = plan.get("categories") or []
+    severity = plan.get("severity")
+    if municipalities:
+        ctx["last_municipalities"] = municipalities
+        ctx["last_municipality"] = municipalities[0] if len(municipalities) == 1 else None
+    if categories:
+        ctx["last_categories"] = categories
+        ctx["last_category"] = categories[0] if len(categories) == 1 else None
+    if severity in {"CRITICAL", "HIGH", "MEDIUM", "LOW"}:
+        ctx["last_severity"] = severity
 
 
 @router.post("/chat")
@@ -762,113 +840,152 @@ async def chat(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Chat with processed data: fast intent → LLM narration → suggestions."""
-    ctx = _ctx(run_id, current_user.id)
-    fast = await _fast_intent(message, run_id, db, current_user.id)
-    if fast:
-        sql, params, kind = fast
-        try:
-            columns, data = await _run_sql(db, sql, params)
-        except Exception as exc:
-            raise HTTPException(500, f"Ошибка при выполнении запроса: {str(exc)[:200]}") from exc
+    """Fast single-LLM-call chat → SQL → rule-based table render.
 
-        serialized = _serialize_data(data)
-        display_data = _display_data(serialized)
+    Target: 4-6 sec on GPU using qwen3:4b. No template fallbacks, no second LLM pass.
+    """
+    user_id = current_user.id
+    ctx = await _get_ctx(db, run_id, user_id)
 
-        # Keep citations, but answer deterministic fast intents from the SQL result.
-        citations = await _fetch_citations(
-            db,
-            run_id,
-            serialized,
-            limit=3,
-            category=ctx.get("last_categories") or ctx.get("last_category"),
-            severity=ctx.get("last_severity"),
-        )
-        narration = None
-        fallback = _make_answer(kind, serialized, message)
-        answer = fallback
+    munis = await _known_municipalities(db, run_id)
+    cats = await _known_categories(db, run_id)
+    munis_str = ", ".join(munis[:25]) or "—"
+    cats_str = ", ".join(cats[:25]) or "—"
 
-        suggestions = _suggestions(kind, serialized, ctx)
-        entry = {"question": message, "answer": answer, "sql": sql, "data": display_data, "citations": citations}
-        ctx["history"].append(entry)
-        ctx["history"] = ctx["history"][-10:]
+    system = f"""Ты — аналитик обращений граждан Омской области. Получаешь вопрос пользователя и формируешь один PostgreSQL SELECT-запрос к таблице problem_clusters.
 
-        return {
-            "answer": answer,
-            "narration": narration,
-            "fallback": fallback,
-            "citations": citations,
-            "sql": sql,
-            "data": display_data,
-            "columns": columns,
-            "kind": kind,
-            "suggestions": suggestions,
-            "fast": True,
-            "context": {
-                "last_municipality": ctx.get("last_municipality"),
-                "last_category": ctx.get("last_category"),
-                "last_categories": ctx.get("last_categories", []),
-                "last_severity": ctx.get("last_severity"),
-            },
-        }
+Таблица problem_clusters (всегда фильтруй WHERE run_id = :run_id):
+- municipality (text) — район
+- cluster_name (text) — название проблемы
+- description (text) — описание
+- category (text) — категория
+- severity (text) — CRITICAL | HIGH | MEDIUM | LOW
+- appeal_count (int) — число обращений
+- rank (int) — ранг проблемы внутри района
+- centroid_text (text) — выдержка из типичного обращения
 
-    # LLM fallback for free-form questions
-    history = ctx.get("history", [])[-5:]
-    history_str = ""
-    for item in history:
-        history_str += f"Пользователь: {item['question']}\nSQL: {item.get('sql', 'нет')}\nОтвет: {(item.get('answer') or '')[:200]}\n\n"
+Доступные категории: {cats_str}
+Доступные районы: {munis_str}
 
-    system = SYSTEM_PROMPT.format(run_id=run_id)
-    prompt = f"{history_str}Пользователь: {message}\nSQL:"
-    sql_response = await _call_ollama(prompt, system)
-    sql = _extract_sql(sql_response)
+Правила:
+1. Возвращай СТРОГО JSON: {{"title": "Краткое название ответа", "sql": "SELECT ..."}}
+2. SQL — только SELECT, обязательно WHERE run_id = :run_id
+3. LIMIT не более 20
+4. Используй SUM(appeal_count) для агрегаций по району/категории
+5. Колонки в SELECT именуй на русском через AS "Колонка"
+6. Если ничего не подходит — верни топ-10 районов по числу проблем"""
 
-    if not sql or not _validate_llm_sql(sql, run_id):
-        answer = "Я не смог построить точный запрос. Уточните: район, категория, тяжесть или 'топ-N'."
-        entry = {"question": message, "answer": answer, "sql": None, "data": None}
-        ctx["history"].append(entry)
-        return {
-            "answer": answer,
-            "sql": None,
-            "data": None,
-            "fast": False,
-            "suggestions": ["Топ-10 районов", "Критические проблемы ЖКХ", "Главные проблемы по всем районам"],
-        }
+    prompt = f'Вопрос: "{message}"\n\nJSON:'
 
+    sql: str | None = None
+    title = "Результат"
     try:
-        columns, data = await _run_sql(db, sql)
-    except Exception as exc:
-        answer = f"Ошибка SQL: {str(exc)[:200]}"
-        entry = {"question": message, "answer": answer, "sql": sql, "data": None}
-        ctx["history"].append(entry)
-        return {"answer": answer, "sql": sql, "data": None, "fast": False}
+        raw = await _call_ollama(prompt, system=system, model=CHAT_LLM_MODEL, num_predict=350, timeout=20, json_mode=True)
+        plan = _parse_json_object(raw) or {}
+        sql_candidate = plan.get("sql") if isinstance(plan, dict) else None
+        sql = _validate_model_sql(sql_candidate)
+        if isinstance(plan, dict) and isinstance(plan.get("title"), str):
+            t = plan["title"].strip()
+            if t:
+                title = t[:120]
+    except Exception:
+        sql = None
+
+    columns: list[str] = []
+    data: list[dict] = []
+    if sql:
+        try:
+            columns, data = await _run_sql(db, sql, {"run_id": run_id})
+        except Exception:
+            await db.rollback()
+            data = []
+
+    # Безопасный fallback — топ-10 районов, без второго LLM-вызова
+    if not data:
+        sql_safe = (
+            "SELECT municipality AS \"Район\", "
+            "SUM(appeal_count)::int AS \"Обращений\", "
+            "COUNT(*)::int AS \"Кластеров\" "
+            "FROM problem_clusters WHERE run_id = :run_id "
+            "GROUP BY municipality ORDER BY SUM(appeal_count) DESC NULLS LAST LIMIT 10"
+        )
+        try:
+            columns, data = await _run_sql(db, sql_safe, {"run_id": run_id})
+            sql = sql_safe
+            title = "Топ-10 районов по обращениям"
+        except Exception:
+            await db.rollback()
+            columns, data = [], []
 
     serialized = _serialize_data(data)
     display_data = _display_data(serialized)
-    narration = await _narrate(message, "cluster_list", serialized)
-    fallback = _make_answer("cluster_list", serialized, message)
-    answer = narration or fallback
 
-    entry = {"question": message, "answer": answer, "sql": sql, "data": display_data}
-    ctx["history"].append(entry)
+    # Rule-based рендеринг таблицы — без второго LLM-вызова
+    if not display_data:
+        answer = "Данные не найдены. Загрузите файл или дождитесь окончания обработки."
+    else:
+        lines = [f"{title}:"]
+        for i, row in enumerate(display_data[:10], 1):
+            parts = []
+            for col, val in list(row.items())[:5]:
+                if val is None or val == "":
+                    continue
+                parts.append(f"{col}: {val}")
+            lines.append(f"{i}. " + " · ".join(parts))
+        if len(display_data) > 10:
+            lines.append(f"\n(показано 10 из {len(display_data)})")
+        answer = "\n".join(lines)
 
-    return {
+    entry = {
+        "question": message,
         "answer": answer,
-        "narration": narration,
-        "fallback": fallback,
         "sql": sql,
         "data": display_data,
         "columns": columns,
-        "kind": "cluster_list",
-        "suggestions": _suggestions("cluster_list", serialized, ctx),
+        "citations": [],
+        "kind": "llm_sql",
+        "suggestions": [],
         "fast": False,
+    }
+    ctx["history"].append(entry)
+    ctx["history"] = ctx["history"][-10:]
+    await _save_ctx(db, run_id, user_id, ctx)
+
+    return {
+        "answer": answer,
+        "narration": answer,
+        "fallback": answer,
+        "citations": [],
+        "sql": sql,
+        "data": display_data,
+        "columns": columns,
+        "kind": "llm_sql",
+        "suggestions": [],
+        "fast": False,
+        "context": _context_response(ctx),
+    }
+
+
+@router.get("/chat/history")
+async def get_chat_history(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ctx = await _get_ctx(db, run_id, current_user.id)
+    return {
+        "history": ctx.get("history", [])[-10:],
+        "context": _context_response(ctx),
     }
 
 
 @router.post("/chat/export")
-async def export_chat_result(run_id: int, current_user: User = Depends(get_current_user)):
-    """Export the last chat result table as Excel."""
-    history = _ctx(run_id, current_user.id).get("history", [])
+async def export_chat_result(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    history = (await _get_ctx(db, run_id, current_user.id)).get("history", [])
     if not history:
         raise HTTPException(404, "No chat history")
 
@@ -902,7 +1019,19 @@ async def export_chat_result(run_id: int, current_user: User = Depends(get_curre
 
 
 @router.post("/chat/reset")
-async def reset_chat(run_id: int, current_user: User = Depends(get_current_user)):
-    """Сбросить контекст разговора."""
+async def reset_chat(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     _conversations.pop((run_id, current_user.id), None)
+    row_q = await db.execute(
+        select(ChatMemory).where(
+            and_(ChatMemory.run_id == run_id, ChatMemory.user_id == current_user.id)
+        )
+    )
+    row = row_q.scalar_one_or_none()
+    if row:
+        await db.delete(row)
+        await db.commit()
     return {"ok": True}

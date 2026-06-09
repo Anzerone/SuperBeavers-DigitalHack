@@ -25,7 +25,7 @@ from backend.config import (
     RANK_WEIGHT_TOPIC_DIVERSITY,
     SEVERITY_WEIGHTS,
 )
-from backend.pipeline.llm_utils import get_cached_llm, parse_llm_json, set_cached_llm
+from backend.pipeline.llm_utils import get_cached_llm, ollama_response_text, parse_llm_json, set_cached_llm
 from backend.problem_naming import fallback_problem_name
 
 logger = logging.getLogger(__name__)
@@ -81,13 +81,14 @@ def _name_cluster_llm(cluster: dict) -> tuple[str, str]:
                 "prompt": prompt,
                 "system": "Ты - аналитик обращений граждан. Отвечай только JSON.",
                 "stream": False,
+                "think": False,
                 "options": {"temperature": 0.2, "num_predict": 220},
                 "format": "json",
             },
             timeout=LLM_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
-        data = parse_llm_json(resp.json().get("response", ""))
+        data = parse_llm_json(ollama_response_text(resp.json()))
         if not isinstance(data, dict):
             raise ValueError("cluster naming response is not a JSON object")
 
