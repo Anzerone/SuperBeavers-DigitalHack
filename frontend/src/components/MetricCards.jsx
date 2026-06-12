@@ -91,57 +91,18 @@ function SentimentBar({ breakdown }) {
   )
 }
 
-function formatSignedNumber(value) {
-  if (value == null) return '—'
-  const abs = Math.abs(value).toLocaleString('ru')
-  if (value > 0) return `+${abs}`
-  if (value < 0) return `-${abs}`
-  return '0'
-}
-
-function formatGrowthHint(growth) {
-  if (!growth?.has_previous) return 'Нет предыдущей обработки'
-  const previous = (growth.previous_problem_count ?? 0).toLocaleString('ru')
-  if (growth.delta_percent == null) return `Было ${previous}`
-  const pct = Math.abs(growth.delta_percent).toLocaleString('ru', { maximumFractionDigits: 1 })
-  if (growth.direction === 'up') return `+${pct}% к прошлой обработке`
-  if (growth.direction === 'down') return `-${pct}% к прошлой обработке`
-  return `Без изменений, было ${previous}`
-}
-
 export default function MetricCards({ stats }) {
   const sentimentBreakdown = stats.sentiment_breakdown || {}
   const angryCount = (sentimentBreakdown.ANGRY || 0) + (sentimentBreakdown.DESPERATE || 0)
   const totalSent = Object.values(sentimentBreakdown).reduce((s, v) => s + v, 0)
   const angryPct = totalSent > 0 ? Math.round(angryCount / totalSent * 100) : 0
-  const problemGrowth = stats.problem_growth || {}
-  const hasProblemGrowth = Boolean(problemGrowth.has_previous)
-  const growthDirection = problemGrowth.direction || 'none'
-  const growthColor = growthDirection === 'up'
-    ? 'text-red-600'
-    : growthDirection === 'down'
-      ? 'text-emerald-600'
-      : 'text-gray-800'
-  const growthAccent = !hasProblemGrowth
-    ? 'border-gray-200'
-    : growthDirection === 'up'
-      ? 'border-red-300'
-      : growthDirection === 'down'
-        ? 'border-emerald-300'
-        : 'border-gray-300'
-  const growthIconBg = !hasProblemGrowth
-    ? 'bg-gray-100'
-    : growthDirection === 'up'
-      ? 'bg-red-50'
-      : growthDirection === 'down'
-        ? 'bg-emerald-50'
-        : 'bg-gray-100'
 
   const cards = useMemo(() => [
     {
-      key: 'raw',
-      label: 'В исходном файле',
+      key: 'raw-total',
+      label: 'Всего записей',
       value: stats.raw_records?.toLocaleString('ru') || '0',
+      hint: 'записей в исходном файле',
       accent: 'border-gray-200',
       icon: 'download',
       iconBg: 'bg-gray-100',
@@ -154,27 +115,18 @@ export default function MetricCards({ stats }) {
       accent: 'border-orange-300',
       icon: 'warning',
       iconBg: 'bg-orange-50',
-      footer: <MiniBar breakdown={stats.severity_breakdown} />,
-    },
-    {
-      key: 'problem-growth',
-      label: 'Прирост проблем',
-      value: hasProblemGrowth ? formatSignedNumber(problemGrowth.delta || 0) : '—',
-      hint: formatGrowthHint(problemGrowth),
-      accent: growthAccent,
-      icon: 'trend',
-      iconBg: growthIconBg,
-      valueClass: growthColor,
-    },
-    {
-      key: 'severe',
-      label: 'Критич. + высокие',
-      value: stats.severe_count?.toLocaleString('ru') || '0',
-      hint: `${stats.severe_percent ?? 0}% проблемных`,
-      accent: 'border-red-300',
-      icon: 'priority',
-      iconBg: 'bg-red-50',
-      valueClass: 'text-red-600',
+      footer: (
+        <>
+          <MiniBar breakdown={stats.severity_breakdown} />
+          <div className="mt-2 rounded-lg bg-red-50 px-3 py-2">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-xs font-medium text-red-700">Критич. + высокие</span>
+              <span className="text-sm font-bold text-red-700">{stats.severe_count?.toLocaleString('ru') || '0'}</span>
+            </div>
+            <p className="mt-0.5 text-[11px] text-red-500">{stats.severe_percent ?? 0}% проблемных обращений</p>
+          </div>
+        </>
+      ),
     },
     {
       key: 'municipalities',
@@ -201,9 +153,9 @@ export default function MetricCards({ stats }) {
       label: 'Кластеров проблем',
       value: stats.cluster_count?.toLocaleString('ru') || '0',
       hint: stats.avg_cluster_size ? `~${stats.avg_cluster_size} обращений в кластере` : '',
-      accent: 'border-teal-300',
+      accent: 'border-indigo-300',
       icon: 'cluster',
-      iconBg: 'bg-teal-50',
+      iconBg: 'bg-indigo-50',
       footer: stats.largest_cluster ? (
         <div className="text-xs text-gray-500 mt-2 line-clamp-2" title={stats.largest_cluster.name}>
           <span className="font-medium">Крупнейший:</span>{' '}
@@ -223,7 +175,7 @@ export default function MetricCards({ stats }) {
       valueClass: angryPct > 30 ? 'text-purple-700' : 'text-gray-800',
       footer: <SentimentBar breakdown={sentimentBreakdown} />,
     },
-  ], [stats, sentimentBreakdown, angryCount, totalSent, angryPct, hasProblemGrowth, problemGrowth, growthAccent, growthIconBg, growthColor])
+  ], [stats, sentimentBreakdown, angryCount, totalSent, angryPct])
 
   return (
     <div className="grid grid-cols-2 md:grid-cols-3 gap-3">

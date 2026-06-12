@@ -30,7 +30,7 @@ export default function AlertsPanel({ runId, onSelect }) {
         className="w-full flex items-center justify-between px-4 py-3 hover:bg-gray-50"
       >
         <div className="flex items-center gap-3">
-          <GovIcon name="bell" className="h-5 w-5 text-[#0d7377]" />
+          <GovIcon name="bell" className="h-5 w-5 text-[#2B3990]" />
           <h3 className="text-sm font-semibold text-gray-700">
             Прирост проблем
           </h3>

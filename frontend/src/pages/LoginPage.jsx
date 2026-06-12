@@ -21,14 +21,14 @@ export default function LoginPage({ onLogin }) {
   }
 
   return (
-    <div className="min-h-screen bg-[#e8f0f2] flex items-center justify-center p-6">
+    <div className="min-h-screen bg-[#eef1f7] flex items-center justify-center p-6">
       <form onSubmit={submit} className="w-full max-w-[420px] bg-white rounded-xl shadow-sm p-6">
         <div className="flex items-center gap-3 mb-6">
-          <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-[#0d7377]/10 text-[#0d7377]">
+          <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-[#2B3990]/10 text-[#2B3990]">
             <GovIcon name="app" className="h-6 w-6" />
           </div>
           <div>
-            <h1 className="text-xl font-semibold text-gray-800">Классификатор обращений</h1>
+            <h1 className="text-xl font-semibold text-gray-800">Голос Омска</h1>
             <p className="text-sm text-gray-500">Вход в систему</p>
           </div>
         </div>
@@ -40,7 +40,7 @@ export default function LoginPage({ onLogin }) {
           id="username"
           value={username}
           onChange={e => setUsername(e.target.value)}
-          className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none focus:border-[#0d7377]"
+          className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none focus:border-[#2B3990]"
           autoComplete="username"
         />
 
@@ -52,7 +52,7 @@ export default function LoginPage({ onLogin }) {
           type="password"
           value={password}
           onChange={e => setPassword(e.target.value)}
-          className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none focus:border-[#0d7377]"
+          className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none focus:border-[#2B3990]"
           autoComplete="current-password"
         />
 
@@ -65,7 +65,7 @@ export default function LoginPage({ onLogin }) {
         <button
           type="submit"
           disabled={loading}
-          className="mt-5 w-full rounded-lg bg-[#0d7377] px-4 py-2.5 text-sm font-medium text-white hover:bg-[#0a5c5f] disabled:opacity-50"
+          className="mt-5 w-full rounded-lg bg-[#2B3990] px-4 py-2.5 text-sm font-medium text-white hover:bg-[#1F2A6E] disabled:opacity-50"
         >
           {loading ? 'Вход...' : 'Войти'}
         </button>

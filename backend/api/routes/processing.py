@@ -7,17 +7,19 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_user
+from backend.pipeline import cancel
 from backend.storage.database import get_db
 from backend.storage.models import ProcessingRun, User
 
 router = APIRouter()
 
-# Одновременно допускается только один процесс обработки. Флаг живёт в памяти
-# процесса бэкенда: пока он занят — новые запуски отклоняются. После рестарта
-# бэкенда флаг сбрасывается, а «осиротевшие» running-прогоны в БД помечаются
-# как failed при следующем старте.
+# Тяжёлый пайплайн выполняется по одному: параллельные прогоны дрались бы за
+# GPU/Ollama. Остальные запуски встают в FIFO-очередь и стартуют автоматически.
+# Флаг и очередь живут в памяти процесса бэкенда; после рестарта «осиротевшие»
+# running/pending в БД помечаются как failed при следующем старте.
 _active_lock = threading.Lock()
 _active_run_id: int | None = None
+_queue: list[tuple[int, str]] = []  # (run_id, filepath) в порядке поступления
 
 
 @router.post("/process")
@@ -28,48 +30,89 @@ async def start_processing(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Start background processing pipeline (только один процесс за раз)."""
+    """Запустить обработку или поставить её в очередь, если слот занят."""
     global _active_run_id
+    _ = request
 
+    start_now = False
     with _active_lock:
-        if _active_run_id is not None:
-            raise HTTPException(
-                409,
-                f"Обработка уже выполняется (прогон #{_active_run_id}). "
-                "Дождитесь завершения текущего процесса.",
+        if _active_run_id is None:
+            _active_run_id = -1  # резервируем слот до получения настоящего id
+            start_now = True
+
+    if start_now:
+        try:
+            # Слот свободен и очередь пуста — любые running/pending в БД
+            # осиротели после рестарта бэкенда, помечаем их как failed.
+            await db.execute(
+                update(ProcessingRun)
+                .where(ProcessingRun.status.in_(["running", "pending"]))
+                .values(status="failed", error_message="Прервано: запущена новая обработка")
             )
-        _active_run_id = -1  # резервируем слот до получения настоящего id
+            run = ProcessingRun(
+                user_id=current_user.id,
+                filename=filename,
+                status="running",
+                current_step="Загрузка файла",
+            )
+            db.add(run)
+            await db.commit()
+            await db.refresh(run)
+        except Exception:
+            with _active_lock:
+                _active_run_id = None
+            raise
 
-    try:
-        # Подчищаем зависшие прогоны прошлой сессии: в памяти активного нет,
-        # значит любые running в БД — осиротевшие, помечаем их как failed.
-        await db.execute(
-            update(ProcessingRun)
-            .where(ProcessingRun.status == "running")
-            .values(status="failed", error_message="Прервано: запущена новая обработка")
-        )
-
-        _ = request
-        run = ProcessingRun(
-            user_id=current_user.id,
-            filename=filename,
-            status="running",
-            current_step="Загрузка файла",
-        )
-        db.add(run)
-        await db.commit()
-        await db.refresh(run)
-    except Exception:
         with _active_lock:
-            _active_run_id = None
-        raise
+            _active_run_id = run.id
+        asyncio.create_task(_run_pipeline(run.id, filepath))
+        return {"run_id": run.id, "status": "running", "queue_position": 0}
+
+    # Слот занят — ставим в очередь.
+    run = ProcessingRun(
+        user_id=current_user.id,
+        filename=filename,
+        status="pending",
+        current_step="В очереди на обработку",
+    )
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
 
     with _active_lock:
-        _active_run_id = run.id
+        _queue.append((run.id, filepath))
+        position = len(_queue)
 
-    asyncio.create_task(_run_pipeline(run.id, filepath))
+    return {"run_id": run.id, "status": "pending", "queue_position": position}
 
-    return {"run_id": run.id, "status": "running"}
+
+async def _start_next_from_queue() -> None:
+    """Запустить следующий прогон из очереди (пропуская отменённые)."""
+    global _active_run_id
+    from backend.storage.database import AsyncSessionLocal
+
+    while True:
+        with _active_lock:
+            if _active_run_id is not None or not _queue:
+                return
+            next_id, next_path = _queue.pop(0)
+            _active_run_id = next_id
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(ProcessingRun).where(ProcessingRun.id == next_id))
+            run = result.scalar_one_or_none()
+            if not run or run.status != "pending":
+                # Отменён, пока ждал в очереди — освобождаем слот и берём следующего.
+                with _active_lock:
+                    if _active_run_id == next_id:
+                        _active_run_id = None
+                continue
+            run.status = "running"
+            run.current_step = "Запуск обработки"
+            await session.commit()
+
+        asyncio.create_task(_run_pipeline(next_id, next_path))
+        return
 
 
 async def _run_pipeline(run_id: int, filepath: str):
@@ -95,6 +138,46 @@ async def _run_pipeline(run_id: int, filepath: str):
         with _active_lock:
             if _active_run_id == run_id:
                 _active_run_id = None
+        await _start_next_from_queue()
+
+
+@router.post("/processing/{run_id}/cancel")
+async def cancel_processing(
+    run_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Остановить выполняющуюся обработку (кооперативно, ближайшим шагом)."""
+    result = await db.execute(select(ProcessingRun).where(ProcessingRun.id == run_id))
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(404, "Run not found")
+    if current_user.role != "admin" and run.user_id != current_user.id:
+        raise HTTPException(403, "Можно останавливать только свои обработки")
+
+    if run.status == "pending":
+        # Ещё не стартовал — просто убираем из очереди.
+        with _active_lock:
+            for index, item in enumerate(_queue):
+                if item[0] == run_id:
+                    _queue.pop(index)
+                    break
+        run.status = "failed"
+        run.error_message = "Отменено в очереди"
+        run.current_step = "Отменено"
+        await db.commit()
+        return {"ok": True, "status": "cancelled"}
+
+    if run.status != "running":
+        raise HTTPException(400, "Обработка уже завершена")
+
+    cancel.request_cancel(run_id)
+    # Сразу отражаем остановку в БД: pipeline доостановится на ближайшем шаге.
+    run.status = "failed"
+    run.error_message = "Остановлено пользователем"
+    run.current_step = "Обработка прервана"
+    await db.commit()
+    return {"ok": True, "status": "cancelling"}
 
 
 @router.get("/processing/latest")
@@ -103,7 +186,7 @@ async def get_latest_run(
     db: AsyncSession = Depends(get_db),
 ):
     """Return the latest run for the current user, if any."""
-    filters = [ProcessingRun.status.in_(["completed", "running"])]
+    filters = [ProcessingRun.status.in_(["completed", "running", "pending"])]
     if current_user.role != "admin":
         filters.append(ProcessingRun.user_id == current_user.id)
 
@@ -126,13 +209,13 @@ async def get_latest_run(
 
 @router.get("/processing/{run_id}/status")
 async def get_status(run_id: int, db: AsyncSession = Depends(get_db)):
-    """Get processing status and progress."""
+    """Get processing status and progress (для очереди — позиция и активный файл)."""
     result = await db.execute(select(ProcessingRun).where(ProcessingRun.id == run_id))
     run = result.scalar_one_or_none()
     if not run:
         raise HTTPException(404, "Run not found")
 
-    return {
+    payload = {
         "run_id": run.id,
         "filename": run.filename,
         "status": run.status,
@@ -145,3 +228,22 @@ async def get_status(run_id: int, db: AsyncSession = Depends(get_db)):
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
         "error_message": run.error_message,
     }
+
+    if run.status == "pending":
+        with _active_lock:
+            queued_ids = [item[0] for item in _queue]
+            active_id = _active_run_id
+        if run.id in queued_ids:
+            payload["queue_position"] = queued_ids.index(run.id) + 1
+            payload["queue_size"] = len(queued_ids)
+        if active_id and active_id > 0:
+            active_q = await db.execute(select(ProcessingRun).where(ProcessingRun.id == active_id))
+            active = active_q.scalar_one_or_none()
+            if active:
+                payload["active_run"] = {
+                    "run_id": active.id,
+                    "filename": active.filename,
+                    "progress": active.progress,
+                }
+
+    return payload

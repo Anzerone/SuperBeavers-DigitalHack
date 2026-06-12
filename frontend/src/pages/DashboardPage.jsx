@@ -6,10 +6,12 @@ import FilterBar from '../components/FilterBar.jsx'
 import Charts from '../components/Charts.jsx'
 import OmskMap from '../components/OmskMap.jsx'
 import Timeline from '../components/Timeline.jsx'
-import AlertsPanel from '../components/AlertsPanel.jsx'
+import ComparisonPanel from '../components/ComparisonPanel.jsx'
 import FilterPresets from '../components/FilterPresets.jsx'
 import DataTabs from '../components/DataTabs.jsx'
-import { getStats, getChartData, exportAppeals, downloadReport } from '../api.js'
+import ReportDownloadMenu from '../components/ReportDownloadMenu.jsx'
+import ReportInsightsPanel from '../components/ReportInsightsPanel.jsx'
+import { getStats, getChartData, exportAppeals } from '../api.js'
 import { formatSeverity } from '../utils/severity.js'
 import GovIcon from '../components/GovIcon.jsx'
 
@@ -23,7 +25,7 @@ const stripKey = (obj, key) => {
   return next
 }
 
-export default function DashboardPage({ runId, setRunId }) {
+export default function DashboardPage({ runId, setRunId, processingStatus, dataVersion }) {
   const [stats, setStats] = useState(null)
   const [chartData, setChartData] = useState(null)
   const [filterOptions, setFilterOptions] = useState({ municipalities: [], categories: [] })
@@ -36,26 +38,37 @@ export default function DashboardPage({ runId, setRunId }) {
 
   // Полный (неотфильтрованный) список вариантов для выпадающих фильтров —
   // чтобы выбор одного значения не убирал остальные из списка.
+  // Ретраи: один неудачный запрос (например, бэкенд перезапускался) не должен
+  // оставлять списки пустыми до перезагрузки страницы.
   useEffect(() => {
     if (!runId) return
     let cancelled = false
-    getChartData(runId, {})
-      .then(d => {
-        if (cancelled) return
-        setFilterOptions({
-          municipalities: (d.districts || []).map(x => x.municipality),
-          categories: (d.categories || []).map(x => x.category),
+    let timer = null
+    const load = (attempt = 0) => {
+      getChartData(runId, {})
+        .then(d => {
+          if (cancelled) return
+          setFilterOptions({
+            municipalities: (d.districts || []).map(x => x.municipality),
+            categories: (d.categories || []).map(x => x.category),
+          })
         })
-      })
-      .catch(() => {})
-    return () => { cancelled = true }
-  }, [runId])
+        .catch(() => {
+          if (!cancelled && attempt < 5) timer = setTimeout(() => load(attempt + 1), 3000)
+        })
+    }
+    load()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [runId, dataVersion])
 
   const loadData = useCallback(async () => {
     if (!runId) return
     try {
       const chartScope = activeTab === 'appeals' ? 'appeals' : 'clusters'
-      // Кросс-фильтрация: каждый график фильтруем по ДРУГИМ измерениям, но не
+      // Кросс-фильтрация: каждый график фильтруем по другим измерениям, но не
       // по своему собственному — так все его значения остаются видимыми и
       // кликабельными (можно выбрать несколько прямо на графике).
       const [s, dDist, dCat, dSev] = await Promise.all([
@@ -78,6 +91,12 @@ export default function DashboardPage({ runId, setRunId }) {
 
   useEffect(() => { loadData() }, [loadData])
 
+  // Все 4 уровня тяжести = отсутствие фильтра: выбор всего набора
+  // эквивалентен «без фильтра», поэтому фильтр сбрасывается.
+  const SEVERITY_LEVELS = 4
+  const isFullSeveritySet = (key, values) =>
+    key === 'severity' && new Set(values).size >= SEVERITY_LEVELS
+
   // Каждый фильтр хранит массив выбранных значений (мультивыбор).
   const toggleFilter = (key, value) => {
     if (!value) return
@@ -86,7 +105,7 @@ export default function DashboardPage({ runId, setRunId }) {
       const current = Array.isArray(next[key]) ? next[key] : (next[key] ? [next[key]] : [])
       const exists = current.includes(value)
       const updated = exists ? current.filter(v => v !== value) : [...current, value]
-      if (updated.length) next[key] = updated
+      if (updated.length && !isFullSeveritySet(key, updated)) next[key] = updated
       else delete next[key]
       return next
     })
@@ -96,7 +115,7 @@ export default function DashboardPage({ runId, setRunId }) {
   const setFilterValues = (key, values) => {
     setFilters(prev => {
       const next = { ...prev }
-      if (values && values.length) next[key] = values
+      if (values && values.length && !isFullSeveritySet(key, values)) next[key] = values
       else delete next[key]
       return next
     })
@@ -114,17 +133,20 @@ export default function DashboardPage({ runId, setRunId }) {
 
   const handleChartClick = (key, value) => toggleFilter(key, value)
 
-  const handleProcessingComplete = useCallback(() => {
+  // Завершение обработки фиксирует App (dataVersion растёт) — обновляем срезы,
+  // даже если завершение случилось, пока пользователь был на другой странице.
+  useEffect(() => {
+    if (!dataVersion) return
     loadData()
     setDataRefreshKey(key => key + 1)
-  }, [loadData])
+  }, [dataVersion, loadData])
 
   return (
     <div className="flex gap-4 p-4 max-w-[1400px] mx-auto">
       {/* Left sidebar */}
       <div className="w-[280px] shrink-0 flex flex-col gap-4">
         <FileUpload runId={runId} setRunId={setRunId} />
-        <ProcessingStatus runId={runId} onComplete={handleProcessingComplete} />
+        <ProcessingStatus runId={runId} status={processingStatus} />
       </div>
 
       {/* Main area */}
@@ -138,16 +160,7 @@ export default function DashboardPage({ runId, setRunId }) {
             </div>
             <div className="flex gap-2 shrink-0 items-center">
               <FilterPresets filters={filters} onApply={setFilters} />
-              <button
-                onClick={() => runId && downloadReport(runId)}
-                disabled={!runId}
-                className="px-4 py-2 bg-[#0d7377] text-white rounded-lg text-sm font-medium hover:bg-[#0a5c5f] disabled:opacity-40 transition"
-              >
-                <span className="inline-flex items-center gap-2">
-                  <GovIcon name="report" className="h-4 w-4" />
-                  Отчет
-                </span>
-              </button>
+              <ReportDownloadMenu runId={runId} />
             </div>
           </div>
           {filterCount > 0 && (
@@ -159,10 +172,10 @@ export default function DashboardPage({ runId, setRunId }) {
                   <button
                     key={`${k}:${val}`}
                     onClick={() => toggleFilter(k, val)}
-                    className="flex items-center gap-1 px-2 py-0.5 bg-teal-50 text-teal-700 rounded-full text-xs font-medium hover:bg-teal-100 transition"
+                    className="flex items-center gap-1 px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-full text-xs font-medium hover:bg-indigo-100 transition"
                     title="Кликните чтобы убрать"
                   >
-                    {formatFilterValue(k, val)} <GovIcon name="close" className="h-3 w-3 text-teal-400" />
+                    {formatFilterValue(k, val)} <GovIcon name="close" className="h-3 w-3 text-indigo-400" />
                   </button>
                 ))
               })}
@@ -179,13 +192,7 @@ export default function DashboardPage({ runId, setRunId }) {
         {/* Metrics */}
         {stats && <MetricCards stats={stats} />}
 
-        {/* Alerts (если есть предыдущий run) */}
-        {runId && (
-          <AlertsPanel
-            runId={runId}
-            onSelect={(m) => toggleFilter('municipality', m)}
-          />
-        )}
+        {runId && <ComparisonPanel runId={runId} refreshKey={dataRefreshKey} />}
 
         {/* Filters */}
         <FilterBar
@@ -209,6 +216,15 @@ export default function DashboardPage({ runId, setRunId }) {
         {/* Charts */}
         {chartData && (
           <Charts data={chartData} filters={filters} onChartClick={handleChartClick} activeTab={activeTab} />
+        )}
+
+        {runId && (
+          <ReportInsightsPanel
+            runId={runId}
+            refreshKey={dataRefreshKey}
+            onSelectCategory={(category) => toggleFilter('category', category)}
+            onSelectMunicipality={(municipality) => toggleFilter('municipality', municipality)}
+          />
         )}
 
         {/* Timeline */}

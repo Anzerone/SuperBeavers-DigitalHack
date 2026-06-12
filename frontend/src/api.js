@@ -23,10 +23,31 @@ api.interceptors.response.use(
   error => {
     if (error.response?.status === 401) {
       setAuthToken(null)
+      // Сообщаем приложению, что сессия истекла — App покажет экран входа.
+      window.dispatchEvent(new Event('auth-expired'))
     }
     return Promise.reject(error)
   }
 )
+
+// Принудительно скачиваем blob как файл. Тип octet-stream нужен, чтобы
+// браузеры (например, Яндекс) не открывали office-документы во встроенном
+// просмотрщике, а сохраняли их на диск.
+function downloadBlob(data, filename) {
+  const blob = new Blob([data], { type: 'application/octet-stream' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.rel = 'noopener'
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  setTimeout(() => {
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }, 1500)
+}
 
 export async function login(username, password) {
   const { data } = await api.post('/auth/login', { username, password })
@@ -37,6 +58,16 @@ export async function login(username, password) {
 export async function getCurrentUser() {
   const { data } = await api.get('/auth/me')
   return data
+}
+
+export async function getUsers() {
+  const { data } = await api.get('/auth/users')
+  return data.users || []
+}
+
+export async function createUser(payload) {
+  const { data } = await api.post('/auth/users', payload)
+  return data.user
 }
 
 export function logout() {
@@ -78,13 +109,33 @@ export async function getStatus(runId) {
   return data
 }
 
+export async function cancelProcessing(runId) {
+  const { data } = await api.post(`/processing/${runId}/cancel`)
+  return data
+}
+
 export async function getLatestRun() {
   const { data } = await api.get('/processing/latest')
   return data
 }
 
 export async function getStats(runId) {
-  const { data } = await api.get(`/dashboard/stats/${runId}`)
+  const { data } = await api.get(`/dashboard/stats/${runId}`, { params: { _t: Date.now() } })
+  return data
+}
+
+export async function getComparison(runId) {
+  const { data } = await api.get(`/dashboard/comparison/${runId}`)
+  return data
+}
+
+export async function getResolvedAnalytics(runId) {
+  const { data } = await api.get(`/dashboard/resolved/${runId}`, { params: { _t: Date.now() } })
+  return data
+}
+
+export async function getReportInsights(runId) {
+  const { data } = await api.get(`/dashboard/report-insights/${runId}`)
   return data
 }
 
@@ -133,22 +184,14 @@ export async function getAppeals(runId, params = {}) {
 export async function exportAppeals(runId, filters = {}) {
   const params = new URLSearchParams(flattenFilters(filters))
   const resp = await api.get(`/appeals/${runId}/export?${params}`, { responseType: 'blob' })
-  const url = URL.createObjectURL(resp.data)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = 'appeals_export.xlsx'
-  a.click()
-  URL.revokeObjectURL(url)
+  downloadBlob(resp.data, 'Выгрузка обращений.xlsx')
 }
 
-export async function downloadReport(runId) {
-  const resp = await api.get(`/reports/${runId}/excel`, { responseType: 'blob' })
-  const url = URL.createObjectURL(resp.data)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `report_${runId}.xlsx`
-  a.click()
-  URL.revokeObjectURL(url)
+export async function downloadReport(runId, format = 'excel') {
+  const endpoint = format === 'docx' ? 'docx' : 'excel'
+  const extension = format === 'docx' ? 'docx' : 'xlsx'
+  const resp = await api.get(`/reports/${runId}/${endpoint}`, { responseType: 'blob' })
+  downloadBlob(resp.data, format === 'docx' ? 'Аналитическая записка — Голос Омска.docx' : 'Аналитический отчет — Голос Омска.xlsx')
 }
 
 export async function getSimilar(appealId, k = 10) {
@@ -177,7 +220,11 @@ export async function annotateAppeal(payload) {
 }
 
 export async function sendChatMessage(runId, message) {
-  const { data } = await api.post(`/chat?run_id=${runId}&message=${encodeURIComponent(message)}`)
+  const { data } = await api.post(
+    `/chat?run_id=${runId}&message=${encodeURIComponent(message)}`,
+    {},
+    { timeout: 90000 },
+  )
   return data
 }
 
@@ -193,10 +240,5 @@ export async function resetChat(runId) {
 
 export async function exportChatResult(runId) {
   const resp = await api.post(`/chat/export?run_id=${runId}`, {}, { responseType: 'blob' })
-  const url = URL.createObjectURL(resp.data)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = 'chat_result.xlsx'
-  a.click()
-  URL.revokeObjectURL(url)
+  downloadBlob(resp.data, 'Результат запроса.xlsx')
 }

@@ -53,7 +53,7 @@ export default function LearningPage({ runId }) {
     <div className="mx-auto max-w-3xl p-4">
       <div className="bg-white rounded-xl shadow-sm p-5 mb-4">
         <h2 className="flex items-center gap-2 text-lg font-semibold text-gray-800">
-          <GovIcon name="feedback" className="h-5 w-5 text-[#0d7377]" />
+          <GovIcon name="feedback" className="h-5 w-5 text-[#2B3990]" />
           Обратная связь
         </h2>
         <p className="text-sm text-gray-500 mt-1">
@@ -109,16 +109,28 @@ export default function LearningPage({ runId }) {
   )
 }
 
+const NEW_CATEGORY = '__new__'
+
 function AnnotationForm({ categories, severities, initialCategory, initialSeverity, onSubmit, onSkip }) {
   const [category, setCategory] = useState(initialCategory || categories[0])
+  const [customCategory, setCustomCategory] = useState('')
   const [severity, setSeverity] = useState(initialSeverity || 'MEDIUM')
   const [isProblem, setIsProblem] = useState(true)
 
   useEffect(() => {
     setCategory(initialCategory || categories[0])
+    setCustomCategory('')
     setSeverity(initialSeverity || 'MEDIUM')
     setIsProblem(true)
   }, [initialCategory, initialSeverity, categories])
+
+  const finalCategory = category === NEW_CATEGORY ? customCategory.trim() : category
+  const canSave = !isProblem || Boolean(finalCategory)
+
+  const handleSave = () => {
+    if (!canSave) return
+    onSubmit({ category: finalCategory, severity, is_problem: isProblem })
+  }
 
   return (
     <div className="space-y-3">
@@ -127,7 +139,7 @@ function AnnotationForm({ categories, severities, initialCategory, initialSeveri
         <div className="flex gap-2 mt-1">
           <button
             onClick={() => setIsProblem(true)}
-            className={`px-3 py-1 text-xs rounded border ${isProblem ? 'bg-teal-600 text-white border-teal-600' : 'bg-white text-gray-700'}`}
+            className={`px-3 py-1 text-xs rounded border ${isProblem ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700'}`}
           >
             Да
           </button>
@@ -150,7 +162,17 @@ function AnnotationForm({ categories, severities, initialCategory, initialSeveri
               className="block w-full text-sm border border-gray-200 rounded px-2 py-1.5 mt-1"
             >
               {categories.map(c => <option key={c} value={c}>{c}</option>)}
+              <option value={NEW_CATEGORY}>+ Новая категория…</option>
             </select>
+            {category === NEW_CATEGORY && (
+              <input
+                value={customCategory}
+                onChange={e => setCustomCategory(e.target.value)}
+                placeholder="Название новой категории (как в Excel)"
+                className="mt-2 block w-full rounded border border-indigo-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                autoFocus
+              />
+            )}
           </div>
           <div>
             <label className="text-xs text-gray-500">Тяжесть</label>
@@ -159,7 +181,7 @@ function AnnotationForm({ categories, severities, initialCategory, initialSeveri
                 <button
                   key={s}
                   onClick={() => setSeverity(s)}
-                  className={`flex-1 px-2 py-1 text-xs rounded border ${severity === s ? 'bg-teal-600 text-white border-teal-600' : 'bg-white text-gray-700'}`}
+                  className={`flex-1 px-2 py-1 text-xs rounded border ${severity === s ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700'}`}
                 >
                   {formatSeverity(s)}
                 </button>
@@ -171,8 +193,9 @@ function AnnotationForm({ categories, severities, initialCategory, initialSeveri
 
       <div className="flex gap-2 pt-2 border-t">
         <button
-          onClick={() => onSubmit({ category, severity, is_problem: isProblem })}
-          className="flex flex-1 items-center justify-center gap-2 px-4 py-2 bg-[#0d7377] text-white rounded-lg text-sm font-medium hover:bg-[#0a5c5f]"
+          onClick={handleSave}
+          disabled={!canSave}
+          className="flex flex-1 items-center justify-center gap-2 px-4 py-2 bg-[#2B3990] text-white rounded-lg text-sm font-medium hover:bg-[#1F2A6E] disabled:opacity-50"
         >
           <GovIcon name="save" className="h-4 w-4" />
           Сохранить

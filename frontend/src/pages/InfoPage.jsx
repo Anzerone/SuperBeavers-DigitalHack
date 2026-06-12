@@ -4,7 +4,7 @@ function InfoSection({ icon, title, children }) {
   return (
     <section className="bg-white rounded-xl shadow-sm p-5">
       <div className="flex items-start gap-3">
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#0d7377]/10 text-[#0d7377]">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#2B3990]/10 text-[#2B3990]">
           <GovIcon name={icon} className="h-5 w-5" />
         </div>
         <div className="min-w-0">
@@ -23,7 +23,7 @@ function InfoList({ items }) {
     <ul className="space-y-2">
       {items.map(item => (
         <li key={item} className="flex gap-2">
-          <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-[#0d7377]" />
+          <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-[#2B3990]" />
           <span>{item}</span>
         </li>
       ))}
@@ -35,7 +35,7 @@ export default function InfoPage({ isAdmin }) {
   return (
     <main className="mx-auto max-w-5xl p-4">
       <div className="mb-4 bg-white rounded-xl shadow-sm p-5">
-        <p className="text-xs font-medium uppercase tracking-wide text-[#0d7377]">Справка</p>
+        <p className="text-xs font-medium uppercase tracking-wide text-[#2B3990]">Справка</p>
         <h1 className="mt-1 text-2xl font-semibold text-gray-900">Как работать с сервисом</h1>
         <p className="mt-2 max-w-3xl text-sm leading-6 text-gray-500">
           Здесь собраны основные сценарии: загрузка обращений, анализ графиков, фильтрация, работа с таблицами,

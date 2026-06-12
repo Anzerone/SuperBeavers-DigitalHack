@@ -96,7 +96,7 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport, act
           <button
             onClick={() => { changeTab('clusters'); setClusterFilter(null); setPage(1) }}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition ${
-              tab === 'clusters' ? 'border-[#0d7377] text-[#0d7377]' : 'border-transparent text-gray-500 hover:text-gray-700'
+              tab === 'clusters' ? 'border-[#2B3990] text-[#2B3990]' : 'border-transparent text-gray-500 hover:text-gray-700'
             }`}
           >
             Кластеры проблем
@@ -104,7 +104,7 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport, act
           <button
             onClick={() => { changeTab('appeals'); setPage(1) }}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition ${
-              tab === 'appeals' ? 'border-[#0d7377] text-[#0d7377]' : 'border-transparent text-gray-500 hover:text-gray-700'
+              tab === 'appeals' ? 'border-[#2B3990] text-[#2B3990]' : 'border-transparent text-gray-500 hover:text-gray-700'
             }`}
           >
             Обращения
@@ -122,7 +122,7 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport, act
           {clusterFilter && (
             <button
               onClick={() => { setClusterFilter(null); setPage(1) }}
-              className="inline-flex items-center gap-1 text-xs px-2 py-1 bg-[#0d7377]/10 text-[#0d7377] rounded-full"
+              className="inline-flex items-center gap-1 text-xs px-2 py-1 bg-[#2B3990]/10 text-[#2B3990] rounded-full"
             >
               Кластер <GovIcon name="close" className="h-3 w-3" />
             </button>
@@ -171,7 +171,7 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport, act
                       <td className="px-4 py-3">
                         <button
                           onClick={() => goToAppeals(c.id)}
-                          className="text-gray-400 hover:text-[#0d7377] transition"
+                          className="text-gray-400 hover:text-[#2B3990] transition"
                           title="Показать обращения"
                           aria-label="Показать обращения"
                         >
@@ -220,7 +220,7 @@ export default function DataTabs({ runId, filters, refreshKey = 0, onExport, act
                     <button
                       onClick={() => setSimilarFor(a)}
                       title="Найти похожие обращения"
-                      className="text-gray-400 hover:text-teal-700 text-sm"
+                      className="text-gray-400 hover:text-indigo-700 text-sm"
                     >
                       <GovIcon name="search" className="h-4 w-4" />
                     </button>

@@ -6,7 +6,14 @@ const STATUS_LABELS = {
   completed: 'Готово',
   running: 'Обработка',
   failed: 'Ошибка',
-  pending: 'Ожидание',
+  pending: 'В очереди',
+}
+
+const STATUS_BADGES = {
+  completed: 'bg-green-100 text-green-700',
+  running: 'bg-blue-50 text-blue-700',
+  failed: 'bg-red-50 text-red-600',
+  pending: 'bg-amber-50 text-amber-700',
 }
 
 function restoredUpload(status) {
@@ -61,7 +68,11 @@ export default function FileUpload({ runId, setRunId }) {
       setUploaded({ ...result, status: 'running' })
       setFile(f)
       const proc = await startProcessing(result.filepath, result.filename)
+      setUploaded(prev => ({ ...prev, status: proc.status || 'running' }))
       setRunId(proc.run_id)
+      if (proc.status === 'pending' && proc.queue_position) {
+        alert(`Сейчас обрабатывается другой файл. Ваш файл поставлен в очередь: позиция ${proc.queue_position}. Обработка начнётся автоматически.`)
+      }
     } catch (e) {
       alert('Ошибка загрузки: ' + (e.response?.data?.detail || e.message))
     } finally {
@@ -76,13 +87,14 @@ export default function FileUpload({ runId, setRunId }) {
   }
 
   const statusLabel = uploaded ? STATUS_LABELS[uploaded.status] || 'Загружено' : ''
+  const statusBadge = uploaded ? STATUS_BADGES[uploaded.status] || 'bg-green-100 text-green-700' : ''
 
   return (
     <div className="bg-white rounded-xl p-4 shadow-sm">
       <div className="flex items-center justify-between mb-3">
         <h3 className="font-semibold text-sm text-gray-700">Загрузка данных</h3>
         {uploaded && (
-          <span className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded-full">
+          <span className={`text-xs px-2 py-0.5 rounded-full ${statusBadge}`}>
             {statusLabel}
           </span>
         )}
@@ -93,17 +105,17 @@ export default function FileUpload({ runId, setRunId }) {
           onDrop={handleDrop}
           onDragOver={(e) => e.preventDefault()}
           onClick={() => inputRef.current?.click()}
-          className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center cursor-pointer hover:border-[#0d7377] transition"
+          className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center cursor-pointer hover:border-[#2B3990] transition"
         >
-          <GovIcon name="file" className="mx-auto mb-2 h-8 w-8 text-[#0d7377]" />
+          <GovIcon name="file" className="mx-auto mb-2 h-8 w-8 text-[#2B3990]" />
           <p className="text-sm font-medium text-gray-700">Excel с обращениями</p>
           <p className="text-xs text-gray-400">.xlsx, .xls</p>
-          {uploading && <p className="text-xs text-[#0d7377] mt-2">Загрузка...</p>}
+          {uploading && <p className="text-xs text-[#2B3990] mt-2">Загрузка...</p>}
         </div>
       ) : (
         <div className="bg-gray-50 rounded-lg p-3">
           <div className="flex items-center gap-2">
-            <GovIcon name="attachment" className="h-5 w-5 shrink-0 text-[#0d7377]" />
+            <GovIcon name="attachment" className="h-5 w-5 shrink-0 text-[#2B3990]" />
             <div className="min-w-0">
               <p className="text-sm font-medium truncate">{uploaded.filename}</p>
               <p className="text-xs text-gray-400">

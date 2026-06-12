@@ -23,7 +23,7 @@ const CAT_ICONS = {
 }
 
 const CAT_PALETTE = [
-  '#0d7377', '#14b8a6', '#0ea5e9', '#6366f1', '#8b5cf6',
+  '#2B3990', '#14b8a6', '#0ea5e9', '#6366f1', '#8b5cf6',
   '#ec4899', '#f97316', '#eab308', '#84cc16', '#22c55e',
 ]
 
@@ -78,7 +78,7 @@ function TreemapCell(props) {
         width={width}
         height={height}
         fill={fill}
-        stroke={isActive ? '#0a5c5f' : '#fff'}
+        stroke={isActive ? '#1F2A6E' : '#fff'}
         strokeWidth={isActive ? 3 : 2}
       />
       {isActive && width > 18 && height > 18 && (
@@ -226,14 +226,14 @@ export default function Charts({ data, filters, onChartClick, activeTab = 'clust
                   onClick={() => onChartClick('municipality', d.municipality)}
                   title={d.municipality}
                   className={`w-full flex items-center gap-2 px-1.5 py-1 rounded-lg text-left transition focus:outline-none ${
-                    active ? 'bg-teal-50 ring-1 ring-teal-200' : 'hover:bg-gray-50'
+                    active ? 'bg-indigo-50 ring-1 ring-indigo-200' : 'hover:bg-gray-50'
                   } ${dim ? 'opacity-40' : ''}`}
                 >
                   <span className="w-[120px] shrink-0 truncate text-xs text-gray-600">{d.municipality}</span>
                   <div className="flex-1 h-4 bg-gray-100 rounded overflow-hidden">
                     <div
                       className="h-full rounded"
-                      style={{ width: `${pct}%`, background: active ? '#0a5c5f' : '#0d7377' }}
+                      style={{ width: `${pct}%`, background: active ? '#1F2A6E' : '#2B3990' }}
                     />
                   </div>
                   <span className="w-14 shrink-0 text-right text-xs font-medium text-gray-700">{d.count.toLocaleString('ru')}</span>
@@ -341,7 +341,7 @@ export default function Charts({ data, filters, onChartClick, activeTab = 'clust
                   key={i}
                   onClick={() => onChartClick('category', c.category)}
                   className={`w-full text-left flex items-center gap-2 p-1.5 rounded-lg transition ${
-                    isActive ? 'bg-teal-50 ring-1 ring-teal-200' : 'hover:bg-gray-50'
+                    isActive ? 'bg-indigo-50 ring-1 ring-indigo-200' : 'hover:bg-gray-50'
                   }`}
                   title={c.category}
                 >

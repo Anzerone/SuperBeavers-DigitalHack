@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Классификатор обращений граждан",
+    title="Голос Омска — аналитика обращений граждан",
     description="Омская область — аналитика обращений на базе LLM",
     version="1.0.0",
     lifespan=lifespan,

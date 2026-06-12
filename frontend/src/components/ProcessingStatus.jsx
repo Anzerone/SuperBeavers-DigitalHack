@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getStatus } from '../api.js'
+import { cancelProcessing } from '../api.js'
 import GovIcon from './GovIcon.jsx'
 
 const STEPS = [
@@ -9,8 +9,6 @@ const STEPS = [
   { name: 'Подготовка аналитической сводки', startAt: 0.9, doneAt: 1 },
 ]
 
-const POLL_DELAY_MS = 1000
-const RETRY_DELAY_MS = 3000
 const TICK_MS = 80
 const CAP_PADDING = 0.008
 
@@ -30,39 +28,31 @@ function visualCapFor(progress) {
   return Math.max(progress, 1 - CAP_PADDING)
 }
 
-export default function ProcessingStatus({ runId, onComplete }) {
-  const [status, setStatus] = useState(null)
+// Статус приходит сверху (App опрашивает бэкенд глобально), компонент только
+// анимирует прогресс — обработка продолжается и при уходе на другую страницу.
+export default function ProcessingStatus({ runId, status }) {
   const [displayProgress, setDisplayProgress] = useState(0)
+  const [cancelling, setCancelling] = useState(false)
 
   useEffect(() => {
-    setStatus(null)
     setDisplayProgress(0)
+    setCancelling(false)
   }, [runId])
 
-  useEffect(() => {
-    if (!runId) return
-    let cancelled = false
-
-    const poll = async () => {
-      try {
-        const nextStatus = await getStatus(runId)
-        if (cancelled) return
-        setStatus(nextStatus)
-        if (nextStatus.status === 'completed') {
-          onComplete?.()
-        } else if (nextStatus.status === 'running') {
-          setTimeout(poll, POLL_DELAY_MS)
-        }
-      } catch (e) {
-        if (!cancelled) setTimeout(poll, RETRY_DELAY_MS)
-      }
+  const handleCancel = async () => {
+    if (!runId || cancelling) return
+    const message = status?.status === 'pending'
+      ? 'Убрать файл из очереди обработки?'
+      : 'Прервать обработку файла? Прогресс будет потерян.'
+    if (!window.confirm(message)) return
+    setCancelling(true)
+    try {
+      await cancelProcessing(runId)
+    } catch (e) {
+      alert('Не удалось остановить: ' + (e.response?.data?.detail || e.message))
+      setCancelling(false)
     }
-
-    poll()
-    return () => {
-      cancelled = true
-    }
-  }, [runId, onComplete])
+  }
 
   useEffect(() => {
     if (!status) return
@@ -100,6 +90,56 @@ export default function ProcessingStatus({ runId, onComplete }) {
 
   if (!runId || !status) return null
 
+  // Файл ждёт своей очереди: показываем позицию и что обрабатывается сейчас.
+  if (status.status === 'pending') {
+    return (
+      <div className="bg-white rounded-lg p-4 shadow-sm">
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-sm font-semibold text-gray-800">Очередь обработки</span>
+          <span className="flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-semibold text-amber-700">
+            <GovIcon name="clock" className="h-3.5 w-3.5" />
+            {status.queue_position ? `${status.queue_position}-й в очереди` : 'В очереди'}
+          </span>
+        </div>
+
+        <p className="text-xs leading-5 text-gray-500">
+          Файл <span className="font-medium text-gray-700">{status.filename}</span> поставлен в очередь
+          {status.queue_size > 1 && status.queue_position
+            ? ` (позиция ${status.queue_position} из ${status.queue_size})`
+            : ''}.
+          Обработка начнётся автоматически.
+        </p>
+
+        {status.active_run && (
+          <div className="mt-3 rounded-lg bg-gray-50 px-3 py-2">
+            <p className="text-[11px] uppercase tracking-wide text-gray-400">Сейчас обрабатывается</p>
+            <p className="mt-0.5 truncate text-xs font-medium text-gray-700" title={status.active_run.filename}>
+              {status.active_run.filename}
+            </p>
+            <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-gray-200">
+              <div
+                className="h-full rounded-full bg-[#2B3990] transition-[width] duration-500"
+                style={{ width: `${Math.round((status.active_run.progress || 0) * 100)}%` }}
+              />
+            </div>
+            <p className="mt-1 text-right text-[11px] text-gray-400">
+              {Math.round((status.active_run.progress || 0) * 100)}%
+            </p>
+          </div>
+        )}
+
+        <button
+          onClick={handleCancel}
+          disabled={cancelling}
+          className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 transition hover:bg-red-50 disabled:opacity-50"
+        >
+          <GovIcon name="close" className="h-3.5 w-3.5" />
+          {cancelling ? 'Убираем…' : 'Убрать из очереди'}
+        </button>
+      </div>
+    )
+  }
+
   const displayPct = Math.max(0, Math.min(displayProgress * 100, 100))
   const pct = Math.round(displayPct)
   const isDone = status.status === 'completed'
@@ -115,13 +155,13 @@ export default function ProcessingStatus({ runId, onComplete }) {
     <div className="bg-white rounded-lg p-4 shadow-sm">
       <div className="flex items-center justify-between mb-2">
         <span className="text-sm font-semibold text-gray-800">Обработка</span>
-        <span className="text-sm font-semibold text-[#0d7377]">{pct}%</span>
+        <span className="text-sm font-semibold text-[#2B3990]">{pct}%</span>
       </div>
 
       <div className="h-2 bg-gray-200 rounded-full mb-3 overflow-hidden">
         <div
           className={`h-full rounded-full transition-[width] duration-300 ease-out ${
-            isFailed ? 'bg-red-500' : isDone ? 'bg-green-500' : 'bg-[#0d7377]'
+            isFailed ? 'bg-red-500' : isDone ? 'bg-green-500' : 'bg-[#2B3990]'
           }`}
           style={{ width: `${displayPct}%` }}
         />
@@ -137,7 +177,7 @@ export default function ProcessingStatus({ runId, onComplete }) {
           return (
             <div key={step.name} className="flex items-center gap-2 text-sm">
               {state === 'done' && <GovIcon name="check" className="h-4 w-4 shrink-0 text-green-500" />}
-              {state === 'active' && <GovIcon name="spinner" className="h-4 w-4 shrink-0 animate-spin text-[#0d7377]" />}
+              {state === 'active' && <GovIcon name="spinner" className="h-4 w-4 shrink-0 animate-spin text-[#2B3990]" />}
               {state === 'pending' && <GovIcon name="clock" className="h-4 w-4 shrink-0 text-gray-300" />}
               <span
                 className={
@@ -154,6 +194,17 @@ export default function ProcessingStatus({ runId, onComplete }) {
           )
         })}
       </div>
+
+      {status.status === 'running' && (
+        <button
+          onClick={handleCancel}
+          disabled={cancelling}
+          className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 transition hover:bg-red-50 disabled:opacity-50"
+        >
+          <GovIcon name="stop" className="h-3.5 w-3.5" />
+          {cancelling ? 'Останавливаем…' : 'Прервать обработку'}
+        </button>
+      )}
 
       {isFailed && (
         <p className="mt-3 text-xs text-red-500">Ошибка: {status.error_message?.slice(0, 160)}</p>

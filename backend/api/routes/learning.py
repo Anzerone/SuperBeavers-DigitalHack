@@ -21,6 +21,29 @@ router = APIRouter()
 ANNOTATIONS_PATH = Path(OUTPUT_DIR) / "annotations.jsonl"
 
 
+def _load_custom_categories() -> list[str]:
+    """Категории, добавленные разметчиками вручную (нет в базовом списке)."""
+    known = set(CATEGORIES)
+    custom: list[str] = []
+    if not ANNOTATIONS_PATH.exists():
+        return custom
+    try:
+        with open(ANNOTATIONS_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    category = str(json.loads(line).get("annotated", {}).get("category") or "").strip()
+                except Exception:
+                    continue
+                if category and category not in known and category not in custom:
+                    custom.append(category)
+    except Exception:
+        pass
+    return sorted(custom)
+
+
 def _load_annotated_ids() -> set[int]:
     """Множество уже размеченных appeal_id."""
     ids: set[int] = set()
@@ -78,7 +101,8 @@ async def get_learning_queue(
     return {
         "queue": queue,
         "annotated_count": len(annotated),
-        "categories": CATEGORIES,
+        # Базовый справочник + категории, добавленные разметчиками вручную.
+        "categories": CATEGORIES + _load_custom_categories(),
         "severities": SEVERITIES,
     }
 

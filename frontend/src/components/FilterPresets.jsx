@@ -95,7 +95,7 @@ export default function FilterPresets({ filters, onApply }) {
         onClick={() => setOpen(o => !o)}
         className="px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-xs font-medium hover:bg-gray-50 flex items-center gap-1"
       >
-        <GovIcon name="star" className="h-3.5 w-3.5 text-[#0d7377]" />
+        <GovIcon name="star" className="h-3.5 w-3.5 text-[#2B3990]" />
         Пресеты {presets.length > 0 && <span className="text-gray-400">({presets.length})</span>}
       </button>
       {open && (
@@ -116,7 +116,7 @@ export default function FilterPresets({ filters, onApply }) {
               <button
                 onClick={handleSave}
                 disabled={!name.trim() || activeCount === 0 || saving}
-                className="flex h-7 w-7 items-center justify-center bg-teal-600 text-white rounded text-xs disabled:opacity-40"
+                className="flex h-7 w-7 items-center justify-center bg-indigo-600 text-white rounded text-xs disabled:opacity-40"
                 title={activeCount === 0 ? 'Сначала задайте фильтры' : 'Сохранить'}
               >
                 <GovIcon name="plus" className="h-3.5 w-3.5" />

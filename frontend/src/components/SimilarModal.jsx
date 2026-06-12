@@ -56,7 +56,7 @@ export default function SimilarModal({ appeal, onClose }) {
                 <div className="flex items-baseline justify-between mb-1 gap-2">
                   <div className="text-xs text-gray-500 flex items-center gap-2 flex-wrap">
                   <span className="font-mono">#{item.id}</span>
-                  <span className="px-1.5 py-0.5 bg-teal-50 text-teal-700 rounded font-medium">
+                  <span className="px-1.5 py-0.5 bg-indigo-50 text-indigo-700 rounded font-medium">
                     {(item.similarity * 100).toFixed(1)}% совп.
                   </span>
                   <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${SEVERITY_STYLES[severity] || ''}`}>

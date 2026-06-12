@@ -38,7 +38,7 @@ function MultiSelect({ label, placeholder, options, selected, onChange, formatOp
         type="button"
         onClick={() => setOpen(o => !o)}
         className={`text-sm border rounded-lg px-3 py-1.5 bg-white flex items-center gap-2 min-w-[160px] max-w-[240px] ${
-          selected.length ? 'border-[#0d7377] text-[#0d7377]' : 'border-gray-300 text-gray-700'
+          selected.length ? 'border-[#2B3990] text-[#2B3990]' : 'border-gray-300 text-gray-700'
         }`}
       >
         <span className="truncate flex-1 text-left">{summary}</span>
@@ -70,7 +70,7 @@ function MultiSelect({ label, placeholder, options, selected, onChange, formatOp
                 type="checkbox"
                 checked={selected.includes(opt)}
                 onChange={() => toggle(opt)}
-                className="accent-[#0d7377]"
+                className="accent-[#2B3990]"
               />
               <span className="truncate">{formatOption ? formatOption(opt) : opt}</span>
             </label>
@@ -115,7 +115,7 @@ export default function FilterBar({ filters, filterCount, municipalities = [], c
       <div className="flex items-center gap-2 ml-auto">
         <span className="text-xs text-gray-400">Применено: {filterCount}</span>
         {filterCount > 0 && (
-          <button onClick={onReset} className="text-xs text-[#0d7377] hover:underline">
+          <button onClick={onReset} className="text-xs text-[#2B3990] hover:underline">
             Сбросить
           </button>
         )}

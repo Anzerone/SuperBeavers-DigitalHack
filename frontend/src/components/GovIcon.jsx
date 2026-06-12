@@ -51,6 +51,31 @@ const ICONS = {
   attachment: (
     <path d="M8 12.5 13.8 6.7a3 3 0 0 1 4.2 4.2l-7 7a5 5 0 0 1-7.1-7.1l7.8-7.8" />
   ),
+  bolt: (
+    <path d="M13 2 4.5 13.5H11L10 22l8.5-11.5H12L13 2z" />
+  ),
+  sun: (
+    <>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2" />
+      <path d="M12 20v2" />
+      <path d="m4.9 4.9 1.4 1.4" />
+      <path d="m17.7 17.7 1.4 1.4" />
+      <path d="M2 12h2" />
+      <path d="M20 12h2" />
+      <path d="m4.9 19.1 1.4-1.4" />
+      <path d="m17.7 6.3 1.4-1.4" />
+    </>
+  ),
+  moon: (
+    <path d="M20 13.5A8.5 8.5 0 0 1 10.5 4 7 7 0 1 0 20 13.5z" />
+  ),
+  stop: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <rect x="9" y="9" width="6" height="6" rx="1" />
+    </>
+  ),
   download: (
     <>
       <path d="M12 4v12" />

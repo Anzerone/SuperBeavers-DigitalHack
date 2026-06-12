@@ -79,6 +79,21 @@ class ProcessingRun(Base):
     summaries = relationship("Summary", back_populates="run", cascade="all, delete-orphan")
 
 
+class RunLoadStats(Base):
+    """Агрегаты строк, отброшенных при загрузке файла (до сохранения в appeals).
+
+    Закрытые до анализа и нерешаемые обращения не попадают в таблицу appeals,
+    но нужны для аналитики «Решённые» — здесь хранятся их разрезы по районам,
+    категориям, итогам и месяцам закрытия.
+    """
+    __tablename__ = "run_load_stats"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(Integer, ForeignKey("processing_runs.id", ondelete="CASCADE"), nullable=False, unique=True)
+    prefiltered = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=func.now())
+
+
 class Appeal(Base):
     __tablename__ = "appeals"
 

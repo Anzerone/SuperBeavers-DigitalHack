@@ -12,6 +12,7 @@ from backend.config import (
     NON_PROBLEM_INCIDENT_TYPES,
     STORE_EMBEDDINGS_IN_DB,
 )
+from backend.pipeline import cancel
 from backend.pipeline.aggregator import build_summaries
 from backend.pipeline.bootstrap import bootstrap_classify
 from backend.pipeline.classifier import predict_with_cache, train_and_predict
@@ -20,13 +21,15 @@ from backend.pipeline.embedder import compute_embeddings
 from backend.pipeline.llm_verifier import verify_low_confidence
 from backend.pipeline.loader import load_excel
 from backend.storage.database import get_sync_db
-from backend.storage.models import Appeal, AppealClusterMap, ProcessingRun, ProblemCluster, Summary
+from backend.storage.models import Appeal, AppealClusterMap, ProcessingRun, ProblemCluster, RunLoadStats, Summary
 
 logger = logging.getLogger(__name__)
 
 
 def _update_run(session, run_id: int, **kwargs):
-    """Update processing run status."""
+    """Update processing run status (и точка кооперативной отмены)."""
+    if cancel.is_cancelled(run_id):
+        raise cancel.PipelineCancelled("Обработка остановлена пользователем")
     run = session.get(ProcessingRun, run_id)
     if not run:
         return
@@ -151,6 +154,11 @@ def run_pipeline(run_id: int, filepath: str):
             progress=0.10,
             current_step="Письма загружены и отфильтрованы",
         )
+        # Разрезы отброшенных строк (закрытые до анализа, нерешаемые) — для
+        # графиков на странице «Решённые»: сами строки в appeals не сохраняются.
+        session.query(RunLoadStats).filter(RunLoadStats.run_id == run_id).delete()
+        session.add(RunLoadStats(run_id=run_id, prefiltered=load_stats.get("prefiltered") or {}))
+        session.commit()
         logger.info(
             "Loaded %s rows (raw=%s, dropped Нерешаемый=%s, закрытые=%s) from %s",
             total,
@@ -376,9 +384,31 @@ def run_pipeline(run_id: int, filepath: str):
             cluster_count,
         )
 
+    except cancel.PipelineCancelled:
+        # Статус уже выставлен эндпоинтом отмены; фиксируем шаг и выходим тихо.
+        logger.info("Pipeline cancelled for run %s", run_id)
+        try:
+            session.rollback()
+            run = session.get(ProcessingRun, run_id)
+            if run:
+                run.status = "failed"
+                run.error_message = "Остановлено пользователем"
+                run.current_step = "Обработка прервана"
+                session.commit()
+        except Exception:
+            session.rollback()
     except Exception as exc:
         logger.exception("Pipeline failed for run %s", run_id)
-        _update_run(session, run_id, status="failed", error_message=str(exc)[:1000])
+        try:
+            session.rollback()
+            run = session.get(ProcessingRun, run_id)
+            if run:
+                run.status = "failed"
+                run.error_message = str(exc)[:1000]
+                session.commit()
+        except Exception:
+            session.rollback()
         raise
     finally:
+        cancel.clear(run_id)
         session.close()

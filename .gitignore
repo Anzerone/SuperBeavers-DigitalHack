@@ -58,3 +58,50 @@ ai-notes/
 Пояснительная_записка.docx
 create_plan_docx.js
 create_explanatory_note.js
+
+# ML / neural files
+models/
+checkpoints/
+weights/
+artifacts/
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+*.h5
+*.keras
+*.pkl
+*.joblib
+*.npy
+*.npz
+*.faiss
+
+# Data / uploads / generated reports / documents
+data/
+uploads/
+reports/
+exports/
+*.csv
+*.xlsx
+*.xls
+*.doc
+*.docx
+*.pdf
+*.ppt
+*.pptx
+
+# Local env / build
+.env
+.env.*
+venv/
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+build/
+
+# Temp/debug files
+diff_*.txt
+tmp/

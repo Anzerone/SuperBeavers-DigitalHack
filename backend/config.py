@@ -49,6 +49,10 @@ LLM_FALLBACK_MODEL = "qwen2.5:7b"
 CHAT_LLM_MODEL = os.getenv("CHAT_LLM_MODEL", "qwen2.5:7b")
 CHAT_INTENT_MODEL = os.getenv("CHAT_INTENT_MODEL", "qwen2.5:7b")
 CHAT_LLM_TIMEOUT_SECONDS = _int_env("CHAT_LLM_TIMEOUT_SECONDS", 60)
+# Жёсткий бюджет ответа чата: сначала отрабатывает поиск (полнотекстовый, при
+# пустом результате — векторный), затем LLM-резюме получает остаток бюджета.
+# Если модель не уложилась — отдаём найденные обращения без LLM-резюме, без 500.
+CHAT_ANSWER_DEADLINE_SECONDS = _int_env("CHAT_ANSWER_DEADLINE_SECONDS", 15)
 
 # Embedding
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")

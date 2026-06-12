@@ -6,19 +6,17 @@ import io
 import openpyxl
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from openpyxl.chart import BarChart, PieChart, Reference, BarChart3D
-from openpyxl.chart.label import DataLabelList
+from openpyxl.drawing.image import Image as XLImage
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.worksheet.table import Table, TableStyleInfo
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.display_fields import appeal_display_category, appeal_display_severity, category_value, severity_value
 from backend.labels import format_severity
 from backend.storage.database import get_db
-from backend.storage.models import Appeal, ProblemCluster, ProcessingRun, Summary
+from backend.storage.models import Appeal, AppealClusterMap, ProblemCluster, ProcessingRun, RunLoadStats, Summary
 
 router = APIRouter()
 
@@ -171,6 +169,160 @@ def _main_quote(top_issues: list[dict]) -> str:
     return f"«{excerpt}»" if excerpt else ""
 
 
+def _merge_resolved_counts(rows, key_attr: str, pre_counts: dict | None, limit: int = 8) -> list[dict]:
+    """Слить решено/открыто из выборки с закрытыми до анализа строками файла."""
+    merged: dict[str, dict] = {}
+    for row in rows:
+        key = getattr(row, key_attr) or "Не указано"
+        merged[key] = {"name": key, "resolved": row.resolved or 0, "open": row.open or 0}
+    for key, count in (pre_counts or {}).items():
+        key = str(key).strip() or "Не указано"
+        entry = merged.setdefault(key, {"name": key, "resolved": 0, "open": 0})
+        entry["resolved"] += int(count)
+    items = sorted(merged.values(), key=lambda e: e["resolved"] + e["open"], reverse=True)[:limit]
+    for entry in items:
+        total = entry["resolved"] + entry["open"]
+        entry["rate"] = round(entry["resolved"] / max(total, 1) * 100, 1)
+    return items
+
+
+# === Графики как изображения ===
+# Встроенные OOXML-диаграммы не отрисовываются рядом просмотрщиков
+# (OfficeSuite, мобильные/онлайн вьюверы), поэтому графики рендерятся
+# matplotlib-ом в PNG и вставляются в лист картинками — это работает везде.
+
+BRAND_BLUE = "#2B3990"
+
+
+def _fig_image(fig, width_px: int, height_px: int) -> XLImage:
+    import matplotlib.pyplot as plt
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    image = XLImage(buf)
+    image.width = width_px
+    image.height = height_px
+    return image
+
+
+def _plt():
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def _add_image(ws, image: XLImage, col: int, row: int) -> None:
+    """Вставить картинку через twoCellAnchor (0-based col/row).
+
+    openpyxl по умолчанию пишет oneCellAnchor, который часть просмотрщиков
+    (OfficeSuite и другие упрощённые рендереры) не отрисовывает вовсе.
+    Excel сам всегда использует twoCellAnchor — делаем так же, рамку
+    рассчитываем по фактическим ширинам колонок и высотам строк листа.
+    """
+    from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
+
+    def column_px(index: int) -> int:
+        dim = ws.column_dimensions.get(get_column_letter(index + 1))
+        chars = dim.width if dim is not None and dim.width else 8.43
+        return int(chars * 7 + 5)
+
+    def row_px(index: int) -> int:
+        dim = ws.row_dimensions.get(index + 1)
+        points = dim.height if dim is not None and dim.height else 15.0
+        return int(points * 96 / 72)
+
+    end_col, remaining = col, image.width
+    while remaining > 0 and end_col < col + 60:
+        remaining -= column_px(end_col)
+        end_col += 1
+    end_row, remaining = row, image.height
+    while remaining > 0 and end_row < row + 200:
+        remaining -= row_px(end_row)
+        end_row += 1
+
+    anchor = TwoCellAnchor(editAs="oneCell")
+    anchor._from = AnchorMarker(col=col, colOff=0, row=row, rowOff=0)
+    anchor.to = AnchorMarker(col=end_col, colOff=0, row=end_row, rowOff=0)
+    image.anchor = anchor
+    ws.add_image(image)
+
+
+def _bar_png(labels: list[str], values: list, title: str, width_px: int = 840, height_px: int = 420) -> XLImage:
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(8.4, 4.2))
+    positions = range(len(labels))[::-1]
+    bars = ax.barh(list(positions), values, color=BRAND_BLUE, height=0.62)
+    ax.set_yticks(list(positions))
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_title(title, fontsize=11, fontweight="bold", color="#1A3C6E", loc="left")
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(axis="x", labelsize=8, colors="#6B7280")
+    ax.grid(axis="x", color="#E5E7EB", linewidth=0.7)
+    ax.set_axisbelow(True)
+    max_value = max([v or 0 for v in values] + [1])
+    for bar, value in zip(bars, values):
+        ax.text(
+            (value or 0) + max_value * 0.01, bar.get_y() + bar.get_height() / 2,
+            f"{value:,}".replace(",", " "), va="center", fontsize=8, color="#374151",
+        )
+    fig.tight_layout()
+    return _fig_image(fig, width_px, height_px)
+
+
+def _pie_png(labels: list[str], values: list, colors: list[str], title: str, *, doughnut: bool = False,
+             width_px: int = 430, height_px: int = 330) -> XLImage:
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(4.4, 3.4))
+    shown = [(label, value, color) for label, value, color in zip(labels, values, colors) if (value or 0) > 0]
+    if not shown:
+        shown = [("Нет данных", 1, "#D1D5DB")]
+    wedge_props = {"width": 0.45, "edgecolor": "white"} if doughnut else {"edgecolor": "white"}
+    ax.pie(
+        [item[1] for item in shown],
+        labels=[item[0] for item in shown],
+        colors=[item[2] for item in shown],
+        autopct="%1.0f%%",
+        startangle=90,
+        counterclock=False,
+        wedgeprops=wedge_props,
+        textprops={"fontsize": 8.5, "color": "#374151"},
+        pctdistance=0.78 if doughnut else 0.6,
+    )
+    ax.set_title(title, fontsize=11, fontweight="bold", color="#1A3C6E")
+    fig.tight_layout()
+    return _fig_image(fig, width_px, height_px)
+
+
+def _line_png(labels: list[str], values: list, title: str, width_px: int = 840, height_px: int = 360) -> XLImage:
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(8.4, 3.6))
+    xs = range(len(labels))
+    ax.plot(xs, values, color=BRAND_BLUE, linewidth=2.2, marker="o", markersize=3.5)
+    ax.fill_between(xs, values, color=BRAND_BLUE, alpha=0.08)
+    step = max(len(labels) // 12, 1)
+    ax.set_xticks(list(xs)[::step])
+    ax.set_xticklabels(labels[::step], fontsize=8, rotation=45, ha="right")
+    ax.set_title(title, fontsize=11, fontweight="bold", color="#1A3C6E", loc="left")
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(axis="y", labelsize=8, colors="#6B7280")
+    ax.grid(axis="y", color="#E5E7EB", linewidth=0.7)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    return _fig_image(fig, width_px, height_px)
+
+
+def _month_label(iso_value: str) -> str:
+    try:
+        return datetime.fromisoformat(str(iso_value)).strftime("%m.%Y")
+    except Exception:
+        return str(iso_value)[:7]
+
+
 # === MAIN ENDPOINT ===
 
 @router.get("/reports/{run_id}/excel")
@@ -216,16 +368,6 @@ async def download_report(run_id: int, db: AsyncSession = Depends(get_db)):
     for muni, sev, cnt in sev_per_muni_q.all():
         sev_per_muni[muni][severity_value(sev)] = cnt
 
-    # Category counts
-    category_q = await db.execute(
-        select(display_category.label("category"), func.count().label("count"))
-        .where(and_(Appeal.run_id == run_id, Appeal.is_problem == True))
-        .group_by(display_category)
-        .order_by(func.count().desc())
-        .limit(10)
-    )
-    top_categories = category_q.all()
-
     # Global severity distribution
     global_sev_q = await db.execute(
         select(display_severity.label("severity"), func.count().label("cnt"))
@@ -249,12 +391,119 @@ async def download_report(run_id: int, db: AsyncSession = Depends(get_db)):
     )
     date_min, date_max = date_q.one()
 
+    resolved_by_muni_q = await db.execute(
+        select(
+            Appeal.municipality,
+            func.count().filter(Appeal.date_closed.isnot(None)).label("resolved"),
+            func.count().filter(Appeal.date_closed.is_(None)).label("open"),
+            func.avg(func.extract("epoch", Appeal.date_closed - Appeal.date_created) / 86400).label("avg_days"),
+        )
+        .where(Appeal.run_id == run_id)
+        .group_by(Appeal.municipality)
+        .order_by(func.count().filter(Appeal.date_closed.isnot(None)).desc())
+    )
+    resolved_by_muni = resolved_by_muni_q.all()
+
+    resolved_by_category_q = await db.execute(
+        select(
+            display_category.label("category"),
+            func.count().filter(Appeal.date_closed.isnot(None)).label("resolved"),
+            func.count().filter(Appeal.date_closed.is_(None)).label("open"),
+        )
+        .where(Appeal.run_id == run_id)
+        .group_by(display_category)
+        .order_by(func.count().filter(Appeal.date_closed.isnot(None)).desc())
+    )
+    resolved_by_category = resolved_by_category_q.all()
+
+    # Сводные счетчики статуса (включая отброшенные при загрузке строки)
+    # и показатели качества данных для листа «Решенные проблемы».
+    status_totals_q = await db.execute(
+        select(
+            func.count().label("processed"),
+            func.count().filter(Appeal.date_closed.isnot(None)).label("resolved"),
+            func.count().filter(Appeal.date_closed.is_(None)).label("open"),
+            func.avg(func.extract("epoch", Appeal.date_closed - Appeal.date_created) / 86400)
+            .filter(and_(Appeal.date_closed.isnot(None), Appeal.date_closed >= Appeal.date_created))
+            .label("avg_days"),
+            func.count()
+            .filter(and_(Appeal.date_closed.isnot(None), Appeal.date_closed < Appeal.date_created))
+            .label("bad_dates"),
+            func.count()
+            .filter(and_(Appeal.date_closed.isnot(None), func.nullif(func.trim(Appeal.outcome), "").is_(None)))
+            .label("closed_no_outcome"),
+        )
+        .where(Appeal.run_id == run_id)
+    )
+    status_row = status_totals_q.one()
+
+    load_stats_q = await db.execute(select(RunLoadStats).where(RunLoadStats.run_id == run_id))
+    load_stats_row = load_stats_q.scalar_one_or_none()
+    prefiltered = (load_stats_row.prefiltered if load_stats_row else None) or {}
+    pre_resolved = prefiltered.get("resolved") or {}
+
+    resolved_prefiltered = run.dropped_outcome or 0
+    unsolvable_count = run.dropped_incident_type or 0
+    raw_total = max(run.raw_records or 0, (run.total_records or 0) + resolved_prefiltered + unsolvable_count)
+    status = {
+        "raw_total": raw_total,
+        "processed": status_row.processed or 0,
+        "resolved_in_data": status_row.resolved or 0,
+        "resolved_prefiltered": resolved_prefiltered,
+        "resolved_total": (status_row.resolved or 0) + resolved_prefiltered,
+        "open": status_row.open or 0,
+        "unsolvable": unsolvable_count,
+        "avg_days": round(float(status_row.avg_days or 0), 1),
+        "bad_dates": status_row.bad_dates or 0,
+        "closed_no_outcome": status_row.closed_no_outcome or 0,
+    }
+    status["resolution_rate"] = round(status["resolved_total"] / max(raw_total, 1) * 100, 1)
+
+    # Динамика закрытия: помесячно из выборки + закрытые до анализа.
+    timeline_q = await db.execute(
+        select(func.date_trunc("month", Appeal.date_closed).label("bucket"), func.count().label("count"))
+        .where(and_(Appeal.run_id == run_id, Appeal.date_closed.isnot(None)))
+        .group_by("bucket")
+        .order_by("bucket")
+    )
+    timeline_counts: dict[str, int] = {}
+    for row in timeline_q.all():
+        if row.bucket:
+            timeline_counts[row.bucket.isoformat()] = int(row.count or 0)
+    for bucket, count in (pre_resolved.get("timeline") or {}).items():
+        key = str(bucket)
+        timeline_counts[key] = timeline_counts.get(key, 0) + int(count)
+    timeline = sorted(timeline_counts.items())
+    status["dated_resolved"] = sum(count for _, count in timeline)
+
+    # Крупнейшие решённые проблемы: кластеры с наибольшим числом закрытых обращений.
+    resolved_clusters_q = await db.execute(
+        select(
+            ProblemCluster.municipality,
+            ProblemCluster.cluster_name,
+            ProblemCluster.category,
+            ProblemCluster.description,
+            ProblemCluster.appeal_count,
+            func.count().label("resolved_count"),
+        )
+        .join(AppealClusterMap, AppealClusterMap.cluster_id == ProblemCluster.id)
+        .join(Appeal, Appeal.id == AppealClusterMap.appeal_id)
+        .where(and_(ProblemCluster.run_id == run_id, Appeal.date_closed.isnot(None)))
+        .group_by(ProblemCluster.id)
+        .order_by(func.count().desc())
+        .limit(6)
+    )
+    resolved_clusters = resolved_clusters_q.all()
+
+    merged_by_muni = _merge_resolved_counts(resolved_by_muni, "municipality", pre_resolved.get("by_municipality"))
+    merged_by_category = _merge_resolved_counts(resolved_by_category, "category", pre_resolved.get("by_category"))
+
     wb = openpyxl.Workbook()
 
-    _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_clusters, global_sev, date_min, date_max)
+    _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_clusters, global_sev, date_min, date_max, status)
     _build_top10_sheet(wb, summaries, clusters_by_muni, sev_per_muni)
     _build_top3_sheet(wb, summaries, clusters_by_muni)
-    _build_categories_sheet(wb, top_categories, global_sev, run.problem_count or 0, sev_per_muni, summaries)
+    _build_resolved_sheet(wb, status, resolved_clusters, merged_by_muni, merged_by_category, timeline)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -263,19 +512,278 @@ async def download_report(run_id: int, db: AsyncSession = Depends(get_db)):
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=report_{run_id}.xlsx"},
+        headers={"Content-Disposition": "attachment; filename=report.xlsx; filename*=UTF-8''%D0%90%D0%BD%D0%B0%D0%BB%D0%B8%D1%82%D0%B8%D1%87%D0%B5%D1%81%D0%BA%D0%B8%D0%B9%20%D0%BE%D1%82%D1%87%D0%B5%D1%82%20%E2%80%94%20%D0%93%D0%BE%D0%BB%D0%BE%D1%81%20%D0%9E%D0%BC%D1%81%D0%BA%D0%B0.xlsx"},
+    )
+
+
+@router.get("/reports/{run_id}/docx")
+async def download_report_docx(run_id: int, db: AsyncSession = Depends(get_db)):
+    """Generate a compact Word analytical note for decision makers."""
+    try:
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
+        from docx.shared import Cm, Pt
+    except Exception as exc:
+        raise HTTPException(500, "python-docx is not installed") from exc
+
+    run_q = await db.execute(select(ProcessingRun).where(ProcessingRun.id == run_id))
+    run = run_q.scalar_one_or_none()
+    if not run:
+        raise HTTPException(404, "Run not found")
+    if run.status != "completed":
+        raise HTTPException(400, "Processing not completed yet")
+
+    summaries_q = await db.execute(
+        select(Summary).where(Summary.run_id == run_id).order_by(Summary.rank).limit(10)
+    )
+    summaries = summaries_q.scalars().all()
+
+    clusters_q = await db.execute(
+        select(ProblemCluster)
+        .where(ProblemCluster.run_id == run_id)
+        .order_by(ProblemCluster.appeal_count.desc(), ProblemCluster.rank)
+        .limit(15)
+    )
+    clusters = clusters_q.scalars().all()
+
+    display_category = appeal_display_category()
+    display_severity = appeal_display_severity()
+    categories_q = await db.execute(
+        select(display_category.label("category"), func.count().label("count"))
+        .where(and_(Appeal.run_id == run_id, Appeal.is_problem == True))
+        .group_by(display_category)
+        .order_by(func.count().desc())
+        .limit(8)
+    )
+    categories = categories_q.all()
+
+    severity_q = await db.execute(
+        select(display_severity.label("severity"), func.count().label("count"))
+        .where(and_(Appeal.run_id == run_id, Appeal.is_problem == True))
+        .group_by(display_severity)
+    )
+    severity = {severity_value(row.severity): row.count for row in severity_q.all()}
+
+    resolved_q = await db.execute(
+        select(
+            func.count().filter(Appeal.date_closed.isnot(None)).label("resolved"),
+            func.count().filter(Appeal.date_closed.is_(None)).label("open"),
+            func.avg(func.extract("epoch", Appeal.date_closed - Appeal.date_created) / 86400)
+            .filter(and_(Appeal.date_closed.isnot(None), Appeal.date_closed >= Appeal.date_created))
+            .label("avg_days"),
+        )
+        .where(Appeal.run_id == run_id)
+    )
+    resolved = resolved_q.one()
+
+    date_q = await db.execute(
+        select(func.min(Appeal.date_created), func.max(Appeal.date_created))
+        .where(Appeal.run_id == run_id)
+    )
+    date_min, date_max = date_q.one()
+
+    # === Расчет показателей (решено считается от всех записей файла) ===
+    filtered = run.total_records or 0
+    problems = run.problem_count or 0
+    problem_pct = round(problems / max(filtered, 1) * 100, 1)
+    severe_count = (severity.get("CRITICAL", 0) or 0) + (severity.get("HIGH", 0) or 0)
+    resolved_in_data = resolved.resolved or 0
+    resolved_prefiltered = run.dropped_outcome or 0
+    unsolvable_count = run.dropped_incident_type or 0
+    resolved_count = resolved_in_data + resolved_prefiltered
+    open_count = resolved.open or 0
+    raw_total = max(run.raw_records or 0, filtered + resolved_prefiltered + unsolvable_count)
+    resolved_rate = round(resolved_count / max(raw_total, 1) * 100, 1)
+    avg_days = round(float(resolved.avg_days or 0), 1)
+
+    period = "за весь период данных"
+    if date_min and date_max:
+        period = f"за период с {date_min.strftime('%d.%m.%Y')} по {date_max.strftime('%d.%m.%Y')}"
+
+    # === Классический официальный шаблон записки ===
+    doc = Document()
+    normal = doc.styles["Normal"]
+    normal.font.name = "Times New Roman"
+    normal.font.size = Pt(13)
+    rpr = normal.element.get_or_add_rPr()
+    rfonts = rpr.get_or_add_rFonts()
+    rfonts.set(qn("w:eastAsia"), "Times New Roman")
+    rfonts.set(qn("w:cs"), "Times New Roman")
+
+    for section in doc.sections:
+        section.left_margin = Cm(3)
+        section.right_margin = Cm(1.5)
+        section.top_margin = Cm(2)
+        section.bottom_margin = Cm(2)
+
+    def para(text="", *, bold=False, italic=False, align=WD_ALIGN_PARAGRAPH.JUSTIFY, indent=True, size=None, space_after=6, space_before=0):
+        p = doc.add_paragraph()
+        p.alignment = align
+        fmt = p.paragraph_format
+        fmt.space_after = Pt(space_after)
+        fmt.space_before = Pt(space_before)
+        fmt.line_spacing = 1.15
+        if indent:
+            fmt.first_line_indent = Cm(1.25)
+        run_obj = p.add_run(text)
+        run_obj.bold = bold
+        run_obj.italic = italic
+        if size:
+            run_obj.font.size = Pt(size)
+        return p
+
+    def heading(text):
+        return para(text, bold=True, align=WD_ALIGN_PARAGRAPH.LEFT, indent=False, space_after=6, space_before=12)
+
+    def finish_table(table):
+        table.style = "Table Grid"
+        for row_index, table_row in enumerate(table.rows):
+            for cell in table_row.cells:
+                for cell_paragraph in cell.paragraphs:
+                    cell_paragraph.paragraph_format.space_after = Pt(2)
+                    cell_paragraph.paragraph_format.line_spacing = 1
+                    for cell_run in cell_paragraph.runs:
+                        cell_run.font.size = Pt(11)
+                        if row_index == 0:
+                            cell_run.bold = True
+
+    # Шапка
+    para("АНАЛИТИЧЕСКАЯ ЗАПИСКА", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, indent=False, size=16, space_after=2)
+    para(
+        "по результатам автоматизированной обработки обращений граждан",
+        align=WD_ALIGN_PARAGRAPH.CENTER, indent=False, space_after=2,
+    )
+    para(f"Омская область, {period}", align=WD_ALIGN_PARAGRAPH.CENTER, indent=False, space_after=2)
+    para(
+        f"г. Омск\t\t\t\t\t\t{datetime.now().strftime('%d.%m.%Y')}",
+        align=WD_ALIGN_PARAGRAPH.LEFT, indent=False, italic=True, space_after=12,
+    )
+
+    # 1. Общие сведения
+    heading("1. Общие сведения")
+    para(
+        f"Настоящая записка подготовлена по результатам автоматизированной обработки файла «{run.filename or 'не указан'}». "
+        f"Всего в исходном файле содержится {raw_total:,} записей. ".replace(",", " ")
+        + f"В автоматический анализ (классификация, определение тяжести, кластеризация повторяющихся проблем) "
+        f"включено {filtered:,} актуальных обращений; ".replace(",", " ")
+        + f"{resolved_prefiltered:,} обращений к моменту выгрузки уже были закрыты (итоги «Решено», «Закрыто», «Разъяснено», «Перенаправлено»), "
+        .replace(",", " ")
+        + f"{unsolvable_count:,} отнесены к категории «Нерешаемый».".replace(",", " ")
+    )
+
+    # 2. Ключевые показатели
+    heading("2. Ключевые показатели")
+    metrics = doc.add_table(rows=1, cols=2)
+    metrics.rows[0].cells[0].text = "Показатель"
+    metrics.rows[0].cells[1].text = "Значение"
+    for label, value in [
+        ("Всего записей в исходном файле", f"{raw_total:,}".replace(",", " ")),
+        ("Включено в автоматический анализ", f"{filtered:,}".replace(",", " ")),
+        ("Проблемных обращений", f"{problems:,} ({problem_pct}% от проанализированных)".replace(",", " ")),
+        ("Кластеров повторяющихся проблем", f"{run.cluster_count or 0:,}".replace(",", " ")),
+        ("Обращений критичной и высокой тяжести", f"{severe_count:,}".replace(",", " ")),
+        ("Закрыто", f"{resolved_prefiltered:,}".replace(",", " ")),
+        ("Нерешаемых обращений", f"{unsolvable_count:,}".replace(",", " ")),
+        ("Средний срок решения", f"{avg_days} дн."),
+    ]:
+        row = metrics.add_row().cells
+        row[0].text = label
+        row[1].text = value
+    finish_table(metrics)
+
+    # 3. Территории
+    heading("3. Территории с наибольшей нагрузкой")
+    top_table = doc.add_table(rows=1, cols=4)
+    for cell, label in zip(top_table.rows[0].cells, ["Ранг", "Муниципальное образование", "Проблемных обращений", "Ключевые темы"]):
+        cell.text = label
+    for summary in summaries:
+        issues = []
+        for issue in (summary.top_issues or [])[:3]:
+            if isinstance(issue, dict):
+                name = issue.get("name") or issue.get("category") or ""
+                count = issue.get("count", 0)
+                if name:
+                    issues.append(f"{name} ({count})")
+        row = top_table.add_row().cells
+        row[0].text = str(summary.rank or "")
+        row[1].text = summary.municipality or ""
+        row[2].text = str(summary.problem_count or 0)
+        row[3].text = "; ".join(issues)
+    finish_table(top_table)
+
+    # 4. Категории
+    heading("4. Основные категории проблемных обращений")
+    cat_table = doc.add_table(rows=1, cols=3)
+    for cell, label in zip(cat_table.rows[0].cells, ["Категория", "Обращений", "Доля проблемных"]):
+        cell.text = label
+    for category, count in categories:
+        row = cat_table.add_row().cells
+        row[0].text = category or "Другое"
+        row[1].text = str(count or 0)
+        row[2].text = f"{round((count or 0) / max(problems, 1) * 100, 1)}%"
+    finish_table(cat_table)
+
+    # 5. Кластеры
+    heading("5. Крупнейшие повторяющиеся проблемы")
+    cluster_table = doc.add_table(rows=1, cols=5)
+    for cell, label in zip(cluster_table.rows[0].cells, ["Муниципальное образование", "Проблема", "Категория", "Тяжесть", "Обращений"]):
+        cell.text = label
+    for cluster in clusters[:10]:
+        row = cluster_table.add_row().cells
+        row[0].text = cluster.municipality or ""
+        row[1].text = _problem_name(cluster.cluster_name, cluster.category, cluster.description)
+        row[2].text = category_value(cluster.category)
+        row[3].text = format_severity(severity_value(cluster.severity))
+        row[4].text = str(cluster.appeal_count or 0)
+    finish_table(cluster_table)
+
+    # 6. Выводы
+    heading("6. Выводы и предложения")
+    para(
+        "Первоочередного внимания требуют территории и категории, в которых одновременно высоки количество обращений, "
+        "доля случаев критичной и высокой тяжести и число открытых проблем."
+    )
+    para(
+        "Рекомендуется поручить профильным ведомствам проработку крупнейших повторяющихся проблем, перечисленных в разделе 5, "
+        "с установлением контрольных сроков, а также организовать мониторинг открытых обращений в районах с наибольшей нагрузкой."
+    )
+    para("Детальные таблицы по всем муниципальным образованиям приведены в Excel-версии отчета.")
+
+    # Подпись
+    para("", space_after=18, indent=False)
+    para(
+        "Исполнитель: автоматизированная система «Голос Омска»",
+        align=WD_ALIGN_PARAGRAPH.LEFT, indent=False, space_after=2,
+    )
+    para(
+        f"Дата составления: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        align=WD_ALIGN_PARAGRAPH.LEFT, indent=False, space_after=12,
+    )
+    para(
+        "_____________________ /_____________________/",
+        align=WD_ALIGN_PARAGRAPH.LEFT, indent=False,
+    )
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": "attachment; filename=report.docx; filename*=UTF-8''%D0%90%D0%BD%D0%B0%D0%BB%D0%B8%D1%82%D0%B8%D1%87%D0%B5%D1%81%D0%BA%D0%B0%D1%8F%20%D0%B7%D0%B0%D0%BF%D0%B8%D1%81%D0%BA%D0%B0%20%E2%80%94%20%D0%93%D0%BE%D0%BB%D0%BE%D1%81%20%D0%9E%D0%BC%D1%81%D0%BA%D0%B0.docx"},
     )
 
 
 # === Sheet 1: Executive Summary ===
 
-def _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_clusters, global_sev, date_min, date_max):
+def _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_clusters, global_sev, date_min, date_max, status):
     ws = wb.active
     ws.title = "Итоги для руководства"
     ws.sheet_view.showGridLines = False
 
     # Title
-    ws.cell(row=1, column=1, value="📋 ИТОГИ ДЛЯ РУКОВОДСТВА")
+    ws.cell(row=1, column=1, value="ИТОГИ ДЛЯ РУКОВОДСТВА")
     ws.cell(row=1, column=1).font = TITLE_FONT
     ws.merge_cells("A1:F1")
     ws.row_dimensions[1].height = 28
@@ -302,7 +810,8 @@ def _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_cluste
         ("АКТУАЛЬНЫХ", f"{filtered:,}".replace(",", " "), "после фильтрации"),
         ("ПРОБЛЕМНЫХ", f"{problems:,}".replace(",", " "), f"{problem_pct}% от актуальных"),
         ("КЛАСТЕРОВ", f"{clusters:,}".replace(",", " "), "уникальных проблем"),
-        ("КРИТИЧЕСКИХ", f"{critical:,}".replace(",", " "), "обращений критической тяжести"),
+        ("КРИТИЧЕСКИХ", f"{critical:,}".replace(",", " "), "критической тяжести"),
+        ("РЕШЕНО", f"{status['resolved_total']:,}".replace(",", " "), f"{status['resolution_rate']}% от всех записей"),
     ]
 
     for idx, (label, value, sub) in enumerate(metrics):
@@ -323,7 +832,7 @@ def _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_cluste
 
     # === Critical hotspots ===
     row = 8
-    ws.cell(row=row, column=1, value="🚨 КРИТИЧЕСКИЕ ОЧАГИ (топ-5)")
+    ws.cell(row=row, column=1, value="КРИТИЧЕСКИЕ ОЧАГИ (топ-5)")
     ws.cell(row=row, column=1).font = SECTION_FONT
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
     row += 1
@@ -356,7 +865,7 @@ def _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_cluste
     row += 1
 
     # === LLM summary text ===
-    ws.cell(row=row, column=1, value="📝 Аналитическая справка")
+    ws.cell(row=row, column=1, value="Аналитическая справка")
     ws.cell(row=row, column=1).font = SECTION_FONT
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
     row += 1
@@ -379,47 +888,12 @@ def _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_cluste
     ws.cell(row=row, column=1, value=analytical_text)
     ws.cell(row=row, column=1).alignment = Alignment(wrap_text=True, vertical="top")
     ws.cell(row=row, column=1).font = Font(size=11, color="1F2937")
-    ws.merge_cells(start_row=row, start_column=1, end_row=row + 5, end_column=6)
-    ws.row_dimensions[row].height = 90
-    row += 7
+    ws.merge_cells(start_row=row, start_column=1, end_row=row + 1, end_column=6)
+    ws.row_dimensions[row].height = 58
+    row += 3
 
-    # === Top-10 bar chart ===
-    ws.cell(row=row, column=1, value="📊 Топ-10 проблемных районов")
-    ws.cell(row=row, column=1).font = SECTION_FONT
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
-    row += 1
-
-    chart_start = row
-    ws.cell(row=row, column=1, value="Район")
-    ws.cell(row=row, column=2, value="Проблем")
-    _style_header_row(ws, row, 2)
-    row += 1
-
-    chart_data_start = row
-    for idx, s in enumerate(summaries[:10], 1):
-        ws.cell(row=row, column=1, value=s.municipality)
-        ws.cell(row=row, column=2, value=s.problem_count)
-        _style_data_row(ws, row, 2, zebra=(idx % 2 == 0))
-        row += 1
-    chart_data_end = row - 1
-
-    if chart_data_end >= chart_data_start:
-        bar = BarChart()
-        bar.type = "bar"
-        bar.style = 12
-        bar.title = "Топ-10 районов по количеству проблемных обращений"
-        bar.y_axis.title = None
-        bar.x_axis.title = "Количество обращений"
-        bar.legend = None
-        data_ref = Reference(ws, min_col=2, min_row=chart_start, max_row=chart_data_end, max_col=2)
-        cats_ref = Reference(ws, min_col=1, min_row=chart_data_start, max_row=chart_data_end)
-        bar.add_data(data_ref, titles_from_data=True)
-        bar.set_categories(cats_ref)
-        bar.height = 12
-        bar.width = 22
-        ws.add_chart(bar, "D" + str(chart_start))
-
-    # Column widths
+    # Ширины колонок задаются до вставки картинок: рамка twoCellAnchor
+    # рассчитывается по фактической геометрии листа.
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 26
     ws.column_dimensions["C"].width = 32
@@ -427,6 +901,48 @@ def _build_executive_sheet(wb, run, summaries, clusters_by_muni, critical_cluste
     ws.column_dimensions["E"].width = 14
     ws.column_dimensions["F"].width = 48
 
+    # === Диаграммы (PNG: отображаются в любом просмотрщике, включая OfficeSuite) ===
+    ws.cell(row=row, column=1, value="Топ-10 проблемных районов")
+    ws.cell(row=row, column=1).font = SECTION_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+    row += 1
+
+    top10 = summaries[:10]
+    if top10:
+        _add_image(
+            ws,
+            _bar_png(
+                [s.municipality or "Не указано" for s in top10],
+                [s.problem_count or 0 for s in top10],
+                "Топ-10 районов по количеству проблемных обращений",
+            ),
+            0,
+            row - 1,
+        )
+    row += 23
+
+    ws.cell(row=row, column=1, value="СТРУКТУРА ОБРАЩЕНИЙ")
+    ws.cell(row=row, column=1).font = SECTION_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+    row += 1
+
+    severity_rows = [
+        ("Критическая", global_sev.get("CRITICAL", 0)),
+        ("Высокая", global_sev.get("HIGH", 0)),
+        ("Средняя", global_sev.get("MEDIUM", 0)),
+        ("Низкая", global_sev.get("LOW", 0)),
+    ]
+    _add_image(
+        ws,
+        _pie_png(
+            [label for label, _ in severity_rows],
+            [count for _, count in severity_rows],
+            ["#DC2626", "#F97316", "#EAB308", "#22C55E"],
+            "Тяжесть проблемных обращений",
+        ),
+        0,
+        row - 1,
+    )
     # Freeze top
     ws.freeze_panes = "A3"
 
@@ -591,139 +1107,176 @@ def _build_top3_sheet(wb, summaries, clusters_by_muni):
     ws.freeze_panes = "A3"
 
 
-# === Sheet 4: Categories + Severity charts ===
-
-def _build_categories_sheet(wb, top_categories, global_sev, total_problems, sev_per_muni, summaries):
-    ws = wb.create_sheet("Категории и тяжесть")
+def _build_resolved_sheet(wb, status, resolved_clusters, merged_by_muni, merged_by_category, timeline):
+    ws = wb.create_sheet("Решенные проблемы")
     ws.sheet_view.showGridLines = False
 
-    ws.cell(row=1, column=1, value="📈 Категории проблем и распределение тяжести")
+    ws.cell(row=1, column=1, value="РЕШЕННЫЕ ПРОБЛЕМЫ")
     ws.cell(row=1, column=1).font = TITLE_FONT
-    ws.merge_cells("A1:H1")
+    ws.merge_cells("A1:F1")
     ws.row_dimensions[1].height = 26
 
-    # === Categories table ===
-    ws.cell(row=3, column=1, value="Категории обращений").font = SECTION_FONT
-    ws.merge_cells("A3:C3")
-
-    cat_headers = ["Категория", "Обращений", "Доля"]
-    for col, h in enumerate(cat_headers, 1):
-        ws.cell(row=4, column=col, value=h)
-    _style_header_row(ws, 4, len(cat_headers))
-
-    cat_start = 5
-    row = cat_start
-    for idx, (category, count) in enumerate(top_categories, 1):
-        count = count or 0
-        share = round(count / max(total_problems, 1) * 100, 1)
-        ws.cell(row=row, column=1, value=category)
-        ws.cell(row=row, column=2, value=count)
-        ws.cell(row=row, column=3, value=f"{share}%")
-        _style_data_row(ws, row, len(cat_headers), zebra=(idx % 2 == 0))
-        row += 1
-    cat_end = row - 1
-
-    # Bar chart for categories
-    if cat_end >= cat_start:
-        bar = BarChart()
-        bar.type = "bar"
-        bar.style = 11
-        bar.title = "Распределение обращений по категориям"
-        bar.legend = None
-        bar.x_axis.title = "Количество обращений"
-        data_ref = Reference(ws, min_col=2, min_row=4, max_row=cat_end, max_col=2)
-        cats_ref = Reference(ws, min_col=1, min_row=cat_start, max_row=cat_end)
-        bar.add_data(data_ref, titles_from_data=True)
-        bar.set_categories(cats_ref)
-        bar.height = 10
-        bar.width = 18
-        ws.add_chart(bar, "E3")
-
-    # === Severity distribution ===
-    sev_row_title = cat_end + 3
-    ws.cell(row=sev_row_title, column=1, value="Распределение по тяжести").font = SECTION_FONT
-    ws.merge_cells(start_row=sev_row_title, start_column=1, end_row=sev_row_title, end_column=3)
-
-    sev_headers = ["Тяжесть", "Обращений", "Доля"]
-    for col, h in enumerate(sev_headers, 1):
-        ws.cell(row=sev_row_title + 1, column=col, value=h)
-    _style_header_row(ws, sev_row_title + 1, len(sev_headers))
-
-    sev_data_start = sev_row_title + 2
-    sev_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
-    row = sev_data_start
-    for sev in sev_order:
-        count = global_sev.get(sev, 0)
-        share = round(count / max(total_problems, 1) * 100, 1)
-        ws.cell(row=row, column=1, value=format_severity(sev))
-        ws.cell(row=row, column=2, value=count)
-        ws.cell(row=row, column=3, value=f"{share}%")
-        _color_severity_cell(ws.cell(row=row, column=1), sev)
-        ws.cell(row=row, column=2).border = THIN_BORDER
-        ws.cell(row=row, column=3).border = THIN_BORDER
-        ws.cell(row=row, column=2).alignment = CENTER_MID
-        ws.cell(row=row, column=3).alignment = CENTER_MID
-        row += 1
-    sev_data_end = row - 1
-
-    # Pie chart for severity
-    if sev_data_end >= sev_data_start:
-        pie = PieChart()
-        pie.title = "Распределение по тяжести"
-        data_ref = Reference(ws, min_col=2, min_row=sev_row_title + 1, max_row=sev_data_end, max_col=2)
-        cats_ref = Reference(ws, min_col=1, min_row=sev_data_start, max_row=sev_data_end)
-        pie.add_data(data_ref, titles_from_data=True)
-        pie.set_categories(cats_ref)
-        pie.dataLabels = DataLabelList(showPercent=True)
-        pie.height = 10
-        pie.width = 14
-        ws.add_chart(pie, "E" + str(sev_row_title))
-
-    # === Heatmap: район × тяжесть (top-10 районов) ===
-    heat_row = sev_data_end + 3
-    ws.cell(row=heat_row, column=1, value="Тепловая карта: район × тяжесть (топ-10)").font = SECTION_FONT
-    ws.merge_cells(start_row=heat_row, start_column=1, end_row=heat_row, end_column=6)
-    heat_row += 1
-
-    heat_headers = ["Район", "Критич.", "Высок.", "Средн.", "Низк.", "Всего"]
-    for col, h in enumerate(heat_headers, 1):
-        ws.cell(row=heat_row, column=col, value=h)
-    _style_header_row(ws, heat_row, len(heat_headers))
-    heat_data_start = heat_row + 1
-
-    row = heat_data_start
-    for summary in summaries[:10]:
-        sev = sev_per_muni.get(summary.municipality, {})
-        ws.cell(row=row, column=1, value=summary.municipality)
-        ws.cell(row=row, column=2, value=sev.get("CRITICAL", 0))
-        ws.cell(row=row, column=3, value=sev.get("HIGH", 0))
-        ws.cell(row=row, column=4, value=sev.get("MEDIUM", 0))
-        ws.cell(row=row, column=5, value=sev.get("LOW", 0))
-        ws.cell(row=row, column=6, value=summary.problem_count)
-        for col in range(1, 7):
-            ws.cell(row=row, column=col).border = THIN_BORDER
-            ws.cell(row=row, column=col).alignment = CENTER_MID if col > 1 else LEFT_TOP
-        row += 1
-    heat_data_end = row - 1
-
-    # Color scale on each severity column
-    if heat_data_end >= heat_data_start:
-        for col_letter, color_end in [("B", "FECACA"), ("C", "FED7AA"), ("D", "FEF3C7"), ("E", "D1FAE5")]:
-            ws.conditional_formatting.add(
-                f"{col_letter}{heat_data_start}:{col_letter}{heat_data_end}",
-                ColorScaleRule(
-                    start_type="min", start_color="FFFFFF",
-                    end_type="max", end_color=color_end,
-                ),
-            )
-
-    ws.column_dimensions["A"].width = 28
-    ws.column_dimensions["B"].width = 14
-    ws.column_dimensions["C"].width = 14
+    # Ширины колонок — до вставки картинок (рамка twoCellAnchor по геометрии листа).
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 40
+    ws.column_dimensions["C"].width = 22
     ws.column_dimensions["D"].width = 14
-    ws.column_dimensions["E"].width = 14
-    ws.column_dimensions["F"].width = 14
-    ws.column_dimensions["G"].width = 4
-    ws.column_dimensions["H"].width = 4
+    ws.column_dimensions["E"].width = 16
+    ws.column_dimensions["F"].width = 50
 
-    ws.freeze_panes = "A3"
+    # === Ключевые метрики ===
+    row = 3
+    ws.cell(row=row, column=1, value="Ключевые метрики").font = SECTION_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+    row += 1
+    ws.cell(row=row, column=1, value="Показатель")
+    ws.cell(row=row, column=2, value="Значение")
+    _style_header_row(ws, row, 2)
+    row += 1
+    metric_rows = [
+        ("Решено всего", f"{status['resolved_total']:,} ({status['resolution_rate']}% от всех записей)".replace(",", " ")),
+        ("в т.ч. закрыто до анализа", f"{status['resolved_prefiltered']:,}".replace(",", " ")),
+        ("Открыто (в работе)", f"{status['open']:,}".replace(",", " ")),
+        ("Нерешаемые", f"{status['unsolvable']:,}".replace(",", " ")),
+        ("Средний срок решения", f"{status['avg_days']} дн."),
+    ]
+    for idx, (label, value) in enumerate(metric_rows, 1):
+        ws.cell(row=row, column=1, value=label)
+        ws.cell(row=row, column=2, value=value)
+        _style_data_row(ws, row, 2, zebra=(idx % 2 == 0))
+        row += 1
+
+    # === Основные решённые проблемы ===
+    row += 1
+    ws.cell(row=row, column=1, value="Основные решённые проблемы").font = SECTION_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+    row += 1
+    headers = ["Район", "Проблема", "Категория", "Закрыто", "Всего в кластере", "Описание"]
+    for col, header in enumerate(headers, 1):
+        ws.cell(row=row, column=col, value=header)
+    _style_header_row(ws, row, len(headers))
+    row += 1
+    if resolved_clusters:
+        for idx, cluster in enumerate(resolved_clusters, 1):
+            ws.cell(row=row, column=1, value=cluster.municipality)
+            ws.cell(row=row, column=2, value=_problem_name(cluster.cluster_name, cluster.category, cluster.description))
+            ws.cell(row=row, column=3, value=category_value(cluster.category))
+            ws.cell(row=row, column=4, value=int(cluster.resolved_count or 0))
+            ws.cell(row=row, column=5, value=int(cluster.appeal_count or 0))
+            ws.cell(row=row, column=6, value=_compact_text(cluster.description or "")[:220])
+            _style_data_row(ws, row, len(headers), zebra=(idx % 2 == 0))
+            row += 1
+    else:
+        ws.cell(row=row, column=1, value="В проанализированной выборке закрытых кластеров не найдено")
+        ws.cell(row=row, column=1).font = Font(italic=True, color="6B7280")
+        row += 1
+
+    # === Краткие срезы: районы и категории ===
+    row += 1
+    ws.cell(row=row, column=1, value="Решено по районам (топ-8)").font = SECTION_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    row += 1
+    mini_headers = ["Район", "Решено", "Открыто", "Доля решённых"]
+    for col, header in enumerate(mini_headers, 1):
+        ws.cell(row=row, column=col, value=header)
+    _style_header_row(ws, row, len(mini_headers))
+    row += 1
+    muni_start = row
+    for idx, item in enumerate(merged_by_muni, 1):
+        ws.cell(row=row, column=1, value=item["name"])
+        ws.cell(row=row, column=2, value=item["resolved"])
+        ws.cell(row=row, column=3, value=item["open"])
+        ws.cell(row=row, column=4, value=f"{item['rate']}%")
+        _style_data_row(ws, row, len(mini_headers), zebra=(idx % 2 == 0))
+        row += 1
+    if row - 1 >= muni_start:
+        ws.conditional_formatting.add(
+            f"B{muni_start}:B{row - 1}",
+            ColorScaleRule(start_type="min", start_color="FFFFFF", end_type="max", end_color="D1FAE5"),
+        )
+
+    row += 1
+    ws.cell(row=row, column=1, value="Решено по категориям (топ-8)").font = SECTION_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    row += 1
+    for col, header in enumerate(["Категория", "Решено", "Открыто", "Доля решённых"], 1):
+        ws.cell(row=row, column=col, value=header)
+    _style_header_row(ws, row, 4)
+    row += 1
+    for idx, item in enumerate(merged_by_category, 1):
+        ws.cell(row=row, column=1, value=item["name"])
+        ws.cell(row=row, column=2, value=item["resolved"])
+        ws.cell(row=row, column=3, value=item["open"])
+        ws.cell(row=row, column=4, value=f"{item['rate']}%")
+        _style_data_row(ws, row, 4, zebra=(idx % 2 == 0))
+        row += 1
+
+    # === Положительная динамика ===
+    row += 1
+    ws.cell(row=row, column=1, value="Положительная динамика закрытия").font = SECTION_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+    row += 1
+
+    trend_note = ""
+    counts = [count for _, count in timeline]
+    if len(counts) >= 6:
+        recent = sum(counts[-3:])
+        previous = sum(counts[-6:-3])
+        delta = round((recent - previous) / max(previous, 1) * 100)
+        if delta >= 0:
+            trend_note = f"За последние 3 месяца закрыто {recent:,} обращений — на {delta}% больше, чем в предыдущие 3 месяца.".replace(",", " ")
+        else:
+            trend_note = f"За последние 3 месяца закрыто {recent:,} обращений — на {abs(delta)}% меньше, чем в предыдущие 3 месяца.".replace(",", " ")
+    if trend_note:
+        ws.cell(row=row, column=1, value=trend_note)
+        ws.cell(row=row, column=1).alignment = LEFT_TOP
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+        row += 1
+
+    if timeline:
+        _add_image(
+            ws,
+            _line_png(
+                [_month_label(bucket) for bucket, _ in timeline],
+                [count for _, count in timeline],
+                "Закрытые обращения по месяцам (с указанной датой закрытия)",
+            ),
+            0,
+            row - 1,
+        )
+        row += 19
+
+    # === Замечания к качеству данных ===
+    row += 1
+    ws.cell(row=row, column=1, value="Замечания к качеству данных").font = SECTION_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+    row += 1
+
+    undated = max(status["resolved_total"] - status["dated_resolved"], 0)
+    undated_pct = round(undated / max(status["resolved_total"], 1) * 100, 1)
+    remarks = [
+        f"У {undated:,} из {status['resolved_total']:,} решённых обращений ({undated_pct}%) не указана дата закрытия — "
+        "динамика закрытия построена только по датированным записям.".replace(",", " "),
+    ]
+    if status["bad_dates"]:
+        remarks.append(
+            f"{status['bad_dates']:,} записей имеют дату закрытия раньше даты создания — исключены из расчёта среднего срока.".replace(",", " ")
+        )
+    if status["closed_no_outcome"]:
+        remarks.append(
+            f"У {status['closed_no_outcome']:,} закрытых обращений в выборке не указан итог рассмотрения.".replace(",", " ")
+        )
+    if status["unsolvable"]:
+        remarks.append(
+            f"{status['unsolvable']:,} обращений отмечены как «Нерешаемые» — не учитываются в доле решённых.".replace(",", " ")
+        )
+    for remark in remarks:
+        ws.cell(row=row, column=1, value=f"• {remark}")
+        ws.cell(row=row, column=1).alignment = LEFT_TOP
+        ws.cell(row=row, column=1).font = Font(size=10, color="92400E")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+        row += 1
+
+    ws.freeze_panes = "A2"
+
+
